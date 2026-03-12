@@ -1,0 +1,22 @@
+# 编译输出
+build/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 测试文件
+*.test
+*.out
+test_addresses.txt
+matches.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
