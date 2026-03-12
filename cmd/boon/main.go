@@ -10,10 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"boon/internal/bip44"
 	"boon/internal/bloom"
-	"boon/internal/crypto"
-	"boon/internal/gpu"
+	"boon/internal/compute"
 	"boon/internal/mnemonic"
 )
 
@@ -22,13 +20,14 @@ var (
 	bloomFile        = flag.String("bloom", "", "Bloom过滤器文件路径")
 	batchSize        = flag.Int("batch", 1000, "批次大小")
 	workers          = flag.Int("workers", runtime.NumCPU(), "CPU工作线程数")
+	outputFile       = flag.String("o", "matches.txt", "匹配结果输出文件")
 	verbose          = flag.Bool("v", false, "详细输出")
 )
 
 func main() {
 	flag.Parse()
 
-	// 解析助记词模板
+	// 1. 解析助记词模板
 	if *mnemonicTemplate == "" {
 		log.Fatal("请提供助记词模板，使用 -mnemonic 参数")
 	}
@@ -38,7 +37,7 @@ func main() {
 		log.Fatalf("助记词必须是12个，当前: %d", len(words))
 	}
 
-	// 加载Bloom过滤器
+	// 2. 加载Bloom过滤器
 	var bloomFilter *bloom.Filter
 	if *bloomFile != "" {
 		log.Printf("加载Bloom过滤器: %s", *bloomFile)
@@ -49,104 +48,81 @@ func main() {
 		}
 		log.Println("Bloom过滤器加载完成")
 	} else {
-		log.Println("警告: 未指定Bloom过滤器文件，将跳过地址匹配检查")
+		log.Println("警告: 未指定Bloom过滤器文件，将输出所有计算结果")
 	}
 
-	// 创建枚举器
+	// 3. 创建计算器
+	computer := compute.NewCPUComputer(*workers)
+	defer computer.Close()
+
+	// 4. 创建枚举器
 	enumerator := mnemonic.NewEnumerator(words, *batchSize)
 
-	// 初始化计算引擎
-	var computeEngine interface {
-		ComputeSeedBatch(mnemonics [][]string) ([][]byte, error)
-	}
-
-	// 使用CPU模式（GPU版本需要cuda build tag）
-	log.Printf("使用CPU模式，工作线程数: %d", *workers)
-	computeEngine = gpu.NewCPUFallback(*batchSize, *workers)
-
-	// 统计信息
+	// 5. 统计信息
 	var (
-		totalEnumerated int64
-		totalValid      int64
-		totalMatches    int64
-		statsMu         sync.Mutex
-		startTime       = time.Now()
+		totalProcessed int64
+		totalMatches   int64
+		statsMu        sync.Mutex
+		startTime      = time.Now()
 	)
 
-	// 打印统计信息
+	// 打印统计
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		for range ticker.C {
 			elapsed := time.Since(startTime)
 			statsMu.Lock()
-			enumerated := totalEnumerated
-			valid := totalValid
+			processed := totalProcessed
 			matches := totalMatches
 			statsMu.Unlock()
 
-			rate := float64(enumerated) / elapsed.Seconds()
-			log.Printf("统计: 枚举=%d 有效=%d 匹配=%d 速率=%.2f/s",
-				enumerated, valid, matches, rate)
+			rate := float64(processed) / elapsed.Seconds()
+			log.Printf("统计: 处理=%d 匹配=%d 速率=%.2f/s",
+				processed, matches, rate)
 		}
 	}()
 
-	// 开始处理
+	// 6. 开始处理
 	log.Println("开始枚举助记词...")
 	batchChan := enumerator.BatchEnumerate()
 
 	for batch := range batchChan {
-		// 更新统计
-		statsMu.Lock()
-		totalEnumerated += int64(len(batch))
-		statsMu.Unlock()
-
 		if *verbose {
 			log.Printf("处理批次: %d 个助记词", len(batch))
 		}
 
-		// 计算种子
-		seeds, err := computeEngine.ComputeSeedBatch(batch)
+		// 调用计算器获取地址
+		addresses, err := computer.Compute(batch)
 		if err != nil {
-			log.Printf("计算种子失败: %v", err)
+			log.Printf("计算失败: %v", err)
 			continue
 		}
 
-		// 处理每个种子
-		for i, seed := range seeds {
-			// 派生TRON密钥
-			deriver := bip44.NewDeriverFromSeed(seed)
-			key, err := deriver.DeriveTRON()
-			if err != nil {
-				if *verbose {
-					log.Printf("派生密钥失败: %v", err)
-				}
+		// Bloom过滤测试
+		for i, address := range addresses {
+			if address == nil {
 				continue
 			}
 
-			// 获取公钥
-			pubKeyBytes, err := bip44.GetPublicKeyBytes(key)
-			if err != nil {
-				if *verbose {
-					log.Printf("获取公钥失败: %v", err)
-				}
-				continue
-			}
-
-			// 计算Keccak256并取前20字节
-			address := crypto.Keccak256Hash(pubKeyBytes)
-
-			// 更新有效计数
 			statsMu.Lock()
-			totalValid++
+			totalProcessed++
 			statsMu.Unlock()
 
+			// 如果没有bloom过滤器，输出所有结果
+			if bloomFilter == nil {
+				mnemonicStr := strings.Join(batch[i], " ")
+				log.Printf("助记词: %s", mnemonicStr)
+				log.Printf("地址: %x", address)
+				continue
+			}
+
 			// Bloom过滤检查
-			if bloomFilter != nil && bloomFilter.Contains(address) {
+			if bloomFilter.Contains(address) {
 				statsMu.Lock()
 				totalMatches++
 				statsMu.Unlock()
 
-				// 找到匹配！
+				// 找到匹配
 				mnemonicStr := strings.Join(batch[i], " ")
 				log.Printf("========== 找到匹配 ==========")
 				log.Printf("助记词: %s", mnemonicStr)
@@ -154,11 +130,7 @@ func main() {
 				log.Printf("==============================")
 
 				// 保存到文件
-				f, err := os.OpenFile("matches.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if err == nil {
-					fmt.Fprintf(f, "%s,%x\n", mnemonicStr, address)
-					f.Close()
-				}
+				saveMatch(*outputFile, mnemonicStr, address)
 			}
 		}
 	}
@@ -166,7 +138,19 @@ func main() {
 	// 最终统计
 	elapsed := time.Since(startTime)
 	statsMu.Lock()
-	log.Printf("完成！总计: 枚举=%d 有效=%d 匹配=%d 耗时=%v",
-		totalEnumerated, totalValid, totalMatches, elapsed)
+	log.Printf("完成！总计: 处理=%d 匹配=%d 耗时=%v",
+		totalProcessed, totalMatches, elapsed)
 	statsMu.Unlock()
+}
+
+// saveMatch 保存匹配结果到文件
+func saveMatch(filename, mnemonic string, address []byte) {
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("无法打开输出文件: %v", err)
+		return
+	}
+	defer f.Close()
+
+	fmt.Fprintf(f, "%s,%x\n", mnemonic, address)
 }

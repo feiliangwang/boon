@@ -18,7 +18,7 @@ CUDA_LIB=/usr/local/cuda/lib64
 PROJECT_NAME=boon
 CMD_DIR=cmd/boon
 BUILD_DIR=build
-GPU_DIR=internal/gpu
+COMPUTE_DIR=internal/compute
 
 # 构建标志
 LDFLAGS=-ldflags "-s -w"
@@ -41,7 +41,7 @@ gpu: deps
 	@echo "构建GPU版本..."
 	@mkdir -p $(BUILD_DIR)
 	# 先编译CUDA代码
-	$(NVCC) -c -o $(BUILD_DIR)/gpu.o $(GPU_DIR)/gpu.cu -arch=$(CUDA_ARCH) -I$(CUDA_INCLUDE)
+	$(NVCC) -c -o $(BUILD_DIR)/compute.o $(COMPUTE_DIR)/gpu.cu -arch=$(CUDA_ARCH) -I$(CUDA_INCLUDE)
 	# 然后编译Go代码
 	CGO_LDFLAGS="-L$(CUDA_LIB) -lcuda -lcudart" \
 	$(GOBUILD) $(LDFLAGS) -tags cuda -o $(BUILD_DIR)/$(PROJECT_NAME)-gpu ./$(CMD_DIR)
