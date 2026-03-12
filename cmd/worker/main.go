@@ -18,8 +18,9 @@ import (
 var (
 	schedulerURL = flag.String("scheduler", "http://localhost:8080", "调度服务器地址")
 	workerID     = flag.String("id", "", "Worker ID（留空自动生成）")
-	workers      = flag.Int("workers", runtime.NumCPU(), "并发worker数量")
-	pollInterval = flag.Duration("poll", 100*time.Millisecond, "任务轮询间隔")
+	workers      = flag.Int("workers", runtime.NumCPU(), "并发计算worker数量")
+	prefetch     = flag.Int("prefetch", 0, "预取任务数量（0=自动，默认为workers*2）")
+	pollInterval = flag.Duration("poll", 50*time.Millisecond, "任务轮询间隔")
 )
 
 func main() {
@@ -32,9 +33,20 @@ func main() {
 		id = fmt.Sprintf("%s-%d", hostname, os.Getpid())
 	}
 
-	log.Printf("Worker 启动: %s", id)
-	log.Printf("调度服务器: %s", *schedulerURL)
-	log.Printf("并发数: %d", *workers)
+	prefetchSize := *prefetch
+	if prefetchSize <= 0 {
+		prefetchSize = *workers * 2 // 默认预取worker数量的2倍
+	}
+
+	log.Printf("========================================")
+	log.Printf("  Boon Worker 启动")
+	log.Printf("========================================")
+	log.Printf("  ID:           %s", id)
+	log.Printf("  调度服务器:    %s", *schedulerURL)
+	log.Printf("  计算线程:      %d", *workers)
+	log.Printf("  预取数量:      %d", prefetchSize)
+	log.Printf("  轮询间隔:      %v", *pollInterval)
+	log.Printf("========================================")
 
 	// 创建HTTP客户端
 	client := worker.NewHTTPClient(*schedulerURL)
@@ -46,6 +58,7 @@ func main() {
 	// 创建Worker
 	w := worker.NewWorker(id, client, computer, *workers)
 	w.SetPollInterval(*pollInterval)
+	w.SetPrefetchSize(prefetchSize)
 
 	// 处理信号
 	ctx, cancel := context.WithCancel(context.Background())
@@ -55,8 +68,8 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		<-sigCh
-		log.Println("收到停止信号，正在关闭...")
+		sig := <-sigCh
+		log.Printf("收到信号: %v，正在关闭...", sig)
 		cancel()
 	}()
 
@@ -67,5 +80,12 @@ func main() {
 	<-ctx.Done()
 	w.Stop()
 
-	log.Println("Worker 已停止")
+	// 打印最终统计
+	stats := w.GetStats()
+	log.Printf("========================================")
+	log.Printf("  Worker 已停止")
+	log.Printf("  总拉取: %d", stats["tasks_fetched"])
+	log.Printf("  总计算: %d", stats["tasks_computed"])
+	log.Printf("  总提交: %d", stats["tasks_submitted"])
+	log.Printf("========================================")
 }
