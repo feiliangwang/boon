@@ -1,55 +1,169 @@
 # Boon
 
-TRON 助记词枚举与地址恢复工具。
+TRON 助记词分布式枚举与地址恢复工具。
 
-## 功能
+## 架构
 
-- 🔍 **助记词枚举** - 支持 `?` 占位符，自动枚举所有可能组合
-- ✅ **BIP39验证** - 自动验证助记词合法性，过滤无效组合
-- ⚡ **GPU加速** - 支持 CUDA 加速 PBKDF2 计算（可选）
-- 🔐 **BIP44派生** - 标准 TRON 路径 `m/44'/195'/0'/0/0`
-- 🌸 **Bloom过滤** - 高效地址匹配，从文件加载目标地址集
+```
+┌─────────────────┐       ┌─────────────────┐
+│   Scheduler     │       │     Worker      │
+│   (调度端)       │◄─────►│   (计算端)       │
+├─────────────────┤ HTTP  ├─────────────────┤
+│ • 助记词枚举     │       │ • 获取任务       │
+│ • BIP39验证     │       │ • PBKDF2计算     │
+│ • 任务分发      │       │ • BIP44派生      │
+│ • 结果接收      │       │ • Keccak256      │
+│ • Bloom过滤     │       │ • 提交结果       │
+└─────────────────┘       └─────────────────┘
+        ▲                         ▲
+        │                         │
+        │                  可以启动多个
+        │                  (支持GPU加速)
+```
+
+**两个独立组件：**
+
+1. **Scheduler（调度端）**
+   - 枚举助记词（`?` 占位符）
+   - 验证 BIP39 合法性
+   - 分发任务给 Worker
+   - 接收结果并 Bloom 过滤
+   - 记录匹配结果
+
+2. **Worker（计算端）**
+   - 从 Scheduler 获取任务
+   - 计算 Hash 地址
+   - 提交结果给 Scheduler
+   - 支持分布式部署
+   - 可选 GPU 加速
 
 ## 编译
 
-### CPU 版本（默认）
-
 ```bash
+# 构建所有组件
 make build
-# 或
-make cpu
+
+# 或单独构建
+make scheduler  # 调度器
+make worker     # Worker（CPU）
+make worker-gpu # Worker（GPU，需要CUDA）
 ```
-
-### GPU 版本（需要 CUDA）
-
-```bash
-make gpu
-```
-
-**要求：**
-- CUDA Toolkit 11.x+
-- 兼容的 NVIDIA GPU
 
 ## 使用
 
+### 1. 启动调度器
+
 ```bash
-./build/boon -mnemonic "word1 ? ? word4 word5 word6 word7 word8 word9 word10 word11 word12" -bloom addresses.txt
+./build/scheduler \
+  -mnemonic "word1 word2 ? ? word5 word6 word7 word8 word9 word10 word11 word12" \
+  -bloom addresses.txt \
+  -port 8080
 ```
 
-### 参数说明
+**参数：**
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `-mnemonic` | 助记词模板，未知词用 `?` 代替 | 必填 |
-| `-bloom` | Bloom 过滤器文件路径（hex 编码地址） | 可选 |
+| `-mnemonic` | 助记词模板，`?` 表示未知词 | 必填 |
+| `-bloom` | Bloom 过滤器文件 | 可选 |
 | `-batch` | 批次大小 | 1000 |
-| `-workers` | CPU 工作线程数 | CPU 核心数 |
-| `-gpu` | 使用 GPU 加速 | true |
-| `-v` | 详细输出 | false |
+| `-port` | HTTP 服务端口 | 8080 |
+| `-o` | 匹配结果输出文件 | matches.txt |
 
-### Bloom 过滤器文件格式
+### 2. 启动 Worker
 
-每行一个地址（hex 编码，20 字节）：
+```bash
+# 单机启动
+./build/worker -scheduler http://localhost:8080
+
+# 多机分布式
+# 机器A
+./build/worker -scheduler http://scheduler-ip:8080 -id worker-A
+
+# 机器B（GPU加速）
+./build/worker-gpu -scheduler http://scheduler-ip:8080 -id worker-B
+```
+
+**参数：**
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `-scheduler` | 调度服务器地址 | `http://localhost:8080` |
+| `-id` | Worker ID | 自动生成 |
+| `-workers` | 并发数 | CPU核心数 |
+| `-poll` | 轮询间隔 | 100ms |
+
+### 3. 查看统计
+
+```bash
+curl http://localhost:8080/api/stats
+```
+
+输出：
+```json
+{
+  "total_tasks": 1000,
+  "completed_tasks": 800,
+  "pending_tasks": 200,
+  "matches": 5,
+  "elapsed": "2m30s",
+  "rate": 5.33
+}
+```
+
+## API 接口
+
+### 获取任务
+
+```
+POST /api/task/fetch
+Content-Type: application/json
+
+{"worker_id": "worker-1"}
+```
+
+响应：
+```json
+{
+  "task": {
+    "id": 123,
+    "mnemonics": [["word1", "word2", ...], ...]
+  },
+  "count": 99
+}
+```
+
+### 提交结果
+
+```
+POST /api/task/submit
+Content-Type: application/json
+
+{
+  "worker_id": "worker-1",
+  "task_id": 123,
+  "addresses": ["a1b2c3d4...", "e5f6a7b8...", ...]
+}
+```
+
+### 查看统计
+
+```
+GET /api/stats
+```
+
+## Bloom 过滤器文件格式
+
+Bloom 过滤器使用 gob 编码格式存储。
+
+### 生成 Bloom 文件
+
+```bash
+# 从地址列表生成 Bloom 过滤器
+./build/bloomtool -input addresses.txt -output bloom.gob
+```
+
+**输入文件格式**（每行一个 hex 地址）：
 
 ```
 a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
@@ -57,52 +171,23 @@ b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3
 ...
 ```
 
-## 示例
+**输出文件**: gob 编码的 Bloom 过滤器
 
-### 枚举 1 个未知词
-
-```bash
-./build/boon -mnemonic "abandon ability ? above abuse accident accuse account achieve acid acquire across" -bloom targets.txt -v
-```
-
-### 枚举 2 个未知词
+### 在调度器中使用
 
 ```bash
-./build/boon -mnemonic "? ability ? above abuse accident accuse account achieve acid acquire across" -bloom targets.txt
+./build/scheduler -bloom bloom.gob
 ```
 
-## 输出
+或在 Web UI 创建任务时填写 Bloom 文件路径。
 
-匹配结果会：
-1. 打印到控制台
-2. 追加到 `matches.txt` 文件
+## 性能估算
 
-格式：
-```
-助记词,地址
-word1 word2 word3 ... word12,a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
-```
-
-## 技术细节
-
-### 计算流程
-
-1. **枚举** - 根据 `?` 位置枚举所有 BIP39 词表组合
-2. **验证** - 使用 BIP39 校验和验证助记词合法性
-3. **批次** - 收集合还助记词到批次
-4. **PBKDF2** - 计算 `PBKDF2-HMAC-SHA512(mnemonic, "mnemonic", 2048, 64)` 得到种子
-5. **BIP44** - 从种子派生路径 `m/44'/195'/0'/0/0`
-6. **Keccak256** - 对公钥计算 Keccak256，取前 20 字节
-7. **Bloom** - 检查地址是否在目标集合中
-
-### 性能估算
-
-| 未知词数 | 组合数 | 预计时间（GPU） |
-|----------|--------|-----------------|
-| 1 | 2,048 | < 1秒 |
-| 2 | 4,194,304 | ~数秒 |
-| 3 | 8,589,934,592 | ~数分钟 |
-| 4+ | 极大 | 不建议 |
+| 未知词数 | 组合数 | 建议配置 |
+|----------|--------|----------|
+| 1 | 2,048 | 单机 CPU |
+| 2 | 4,194,304 | 2-4 Worker |
+| 3 | 8.5B | 10+ Worker + GPU |
 
 ## 许可证
 
