@@ -9,14 +9,17 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"syscall"
 	"runtime"
+	"strings"
+	"syscall"
 	"time"
 
 	bip39 "github.com/tyler-smith/go-bip39"
 
 	"boon/internal/bloom"
 	"boon/internal/compute"
+	"boon/internal/mnemonic"
+	"boon/internal/protocol"
 	"boon/internal/worker"
 )
 
@@ -28,6 +31,7 @@ var (
 	useGPU       = flag.Bool("gpu", false, "使用GPU加速（需要CUDA构建）")
 	benchN       = flag.Int("bench", 0, "测速模式：随机生成N个助记词测算计算速度（0=禁用）")
 	verifyN      = flag.Int("verify", 0, "验证模式：随机生成N个助记词对比GPU与CPU结果（0=禁用）")
+	benchFullN   = flag.Int64("bench-full", 0, "全链路测速：模拟完整枚举→验证→计算流程，扫描N个索引（0=禁用）")
 )
 func main() {
 	flag.Parse()
@@ -41,6 +45,12 @@ func main() {
 	// 独立模式：验证
 	if *verifyN > 0 {
 		runVerify(*verifyN, *workers)
+		return
+	}
+
+	// 独立模式：全链路测速
+	if *benchFullN > 0 {
+		runBenchFull(*benchFullN, *useGPU, *workers)
 		return
 	}
 
@@ -73,6 +83,7 @@ func main() {
 	log.Printf("========================================")
 
 	var seedComp compute.SeedComputer
+	gpuMode := false
 	if *useGPU {
 		gpu, err := compute.NewGPUComputer()
 		if err != nil {
@@ -81,13 +92,25 @@ func main() {
 		} else {
 			log.Printf("GPU计算器初始化成功")
 			seedComp = gpu
+			gpuMode = true
 		}
 	} else {
 		seedComp = compute.NewCPUComputer()
 	}
 
 	client := worker.NewCompactClient(*schedulerURL)
-	w := worker.NewCompactWorkerWithComputer(id, client, *workers, seedComp)
+	// GPU 模式：workers=1（避免并发调用 CUDA）；CPU 模式：使用指定并发数
+	effectiveWorkers := *workers
+	if gpuMode {
+		effectiveWorkers = 1
+	}
+	w := worker.NewCompactWorkerWithComputer(id, client, effectiveWorkers, seedComp)
+	if gpuMode {
+		// GPU 最优批次大小 65536，单次大批量调用效率最高
+		w.SetBatchSize(65536)
+		// 多 CPU 核并行枚举，与 GPU 计算流水线重叠
+		w.SetEnumWorkers(runtime.NumCPU())
+	}
 	w.SetBloomFilter(bloomFilter)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -252,6 +275,140 @@ func runVerify(total int, cpuWorkers int) {
 	} else {
 		fmt.Printf("✗ 验证失败  %d/%d 个不一致\n", totalFail, totalChecked)
 		os.Exit(1)
+	}
+}
+
+// ================================================================
+// 全链路测速模式
+// ================================================================
+
+func runBenchFull(total int64, gpu bool, cpuWorkers int) {
+	knownWords := []string{"abandon", "abandon", "abandon", "abandon", "abandon", "abandon", "abandon", "abandon", "", "", "", ""}
+
+	var seedComp compute.SeedComputer
+	compName := "CPU"
+	if gpu {
+		g, err := compute.NewGPUComputer()
+		if err != nil {
+			log.Fatalf("GPU初始化失败: %v\n提示: 需要 CUDA 构建且有可用 GPU", err)
+		}
+		seedComp = g
+		compName = "GPU"
+	} else {
+		seedComp = compute.NewCPUComputer()
+	}
+
+	fmt.Printf("全链路性能分析 (bench-full)\n")
+	fmt.Printf("计算引擎: %s", compName)
+	if !gpu {
+		fmt.Printf(" (%d线程)", cpuWorkers)
+	}
+	fmt.Printf("\n模板: 8个已知词 + 4个未知词 (positions 8-11)\n")
+	fmt.Printf("索引范围: [0, %d)\n\n", total)
+
+	// ── 阶段1：纯枚举+BIP39校验（CPU，单线程）─────────────────────
+	fmt.Printf("── 阶段1: 纯枚举+BIP39校验 ──\n")
+	var validMnemonics []string
+	{
+		enum := worker.NewLocalEnumerator(&worker.TaskTemplate{
+			JobID: 1, Words: append([]string(nil), knownWords...), UnknownPos: []int{8, 9, 10, 11},
+		})
+		validator := mnemonic.NewValidator()
+		start := time.Now()
+		for idx := int64(0); idx < total; idx++ {
+			words, ok := enum.EnumerateAt(idx, validator)
+			if ok {
+				validMnemonics = append(validMnemonics, strings.Join(words, " "))
+			}
+		}
+		elapsed := time.Since(start)
+		validCount := len(validMnemonics)
+		passRate := float64(validCount) / float64(total) * 100
+		fmt.Printf("  总索引: %d  有效助记词: %d (%.1f%%)\n", total, validCount, passRate)
+		fmt.Printf("  耗时: %s  速度: %.0f 索引/s\n\n", fmtDuration(elapsed), float64(total)/elapsed.Seconds())
+	}
+
+	// ── 阶段2：纯计算（GPU/CPU，不含枚举）────────────────────────
+	fmt.Printf("── 阶段2: 纯计算（跳过枚举，直接送入%s）──\n", compName)
+	{
+		batchSize := 65536
+		if !gpu {
+			batchSize = 500
+		}
+		// 热身
+		warmupN := batchSize
+		if warmupN > len(validMnemonics) {
+			warmupN = len(validMnemonics)
+		}
+		seedComp.Compute(validMnemonics[:warmupN])
+
+		computed := 0
+		start := time.Now()
+		for i := 0; i < len(validMnemonics); i += batchSize {
+			end := i + batchSize
+			if end > len(validMnemonics) {
+				end = len(validMnemonics)
+			}
+			seedComp.Compute(validMnemonics[i:end])
+			computed += end - i
+		}
+		elapsed := time.Since(start)
+		fmt.Printf("  计算助记词: %d  批次大小: %d\n", computed, batchSize)
+		fmt.Printf("  耗时: %s  速度: %.0f 助记词/s\n\n", fmtDuration(elapsed), float64(computed)/elapsed.Seconds())
+	}
+
+	// ── 阶段3：完整流水线（枚举→校验→计算串联）───────────────────
+	fmt.Printf("── 阶段3: 完整流水线 ──\n")
+	{
+		effectiveWorkers := cpuWorkers
+		if gpu {
+			effectiveWorkers = 1
+		}
+		batchSizes := []int64{500, 2048, 8192, 32768, 65536, 131072, 262144}
+		if gpu {
+			batchSizes = []int64{65536}
+		}
+
+		// 热身
+		{
+			warmupTask := &protocol.CompactTask{TaskID: 0, JobID: 1, StartIdx: 0, EndIdx: 2048}
+			warmupEnum := worker.NewLocalEnumerator(&worker.TaskTemplate{
+				JobID: 1, Words: append([]string(nil), knownWords...), UnknownPos: []int{8, 9, 10, 11},
+			})
+			cc := compute.NewCompactComputer(effectiveWorkers, seedComp)
+			cc.SetBatchSize(2048)
+			if gpu {
+				cc.SetEnumWorkers(runtime.NumCPU())
+			}
+			cc.ComputeRange(warmupEnum, warmupTask, nil)
+		}
+
+		task := &protocol.CompactTask{TaskID: 1, JobID: 1, StartIdx: 0, EndIdx: total}
+
+		fmt.Printf("  %-12s  %-10s  %-14s  %s\n", "批次大小", "耗时", "速度(索引/s)", "喂入GPU(助记词/s)")
+		fmt.Printf("  %-12s  %-10s  %-14s  %s\n", "------------", "----------", "--------------", "-----------------")
+
+		for _, bs := range batchSizes {
+			enum := worker.NewLocalEnumerator(&worker.TaskTemplate{
+				JobID: 1, Words: append([]string(nil), knownWords...), UnknownPos: []int{8, 9, 10, 11},
+			})
+			cc := compute.NewCompactComputer(effectiveWorkers, seedComp)
+			cc.SetBatchSize(bs)
+			if gpu {
+				cc.SetEnumWorkers(runtime.NumCPU())
+			}
+
+			start := time.Now()
+			result := cc.ComputeRange(enum, task, nil)
+			elapsed := time.Since(start)
+			_ = result
+
+			idxSpeed := float64(total) / elapsed.Seconds()
+			validPerSec := idxSpeed * float64(len(validMnemonics)) / float64(total)
+			fmt.Printf("  %-12d  %-10s  %-14.0f  %.0f\n",
+				bs, fmtDuration(elapsed), idxSpeed, validPerSec)
+		}
+		fmt.Println()
 	}
 }
 

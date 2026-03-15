@@ -71,5 +71,66 @@ func (g *GPUComputer) Compute(mnemonics []string) [][]byte {
 	return result
 }
 
+// EnumerateCompute performs BIP39 enumeration and TRON address derivation entirely on the GPU.
+// knownWordIndices: 12 entries where -1 means unknown position (word index 0-2047 otherwise).
+// unknownPositions: position indices in enumeration order (same order as index decomposition).
+// Returns matched (indices, addresses) pairs that passed BIP39 checksum validation.
+func (g *GPUComputer) EnumerateCompute(
+	startIdx, endIdx int64,
+	knownWordIndices []int16,
+	unknownPositions []int8,
+) (indices []int64, addresses [][]byte, err error) {
+	total := endIdx - startIdx
+	if total <= 0 {
+		return nil, nil, nil
+	}
+
+	// Capacity: pass rate ~6.2% for 4 unknowns; allocate 15% for safety margin
+	capacity := int(total/7) + 2048
+	if capacity < 2048 {
+		capacity = 2048
+	}
+
+	knownC := make([]C.int16_t, 12)
+	for i, v := range knownWordIndices {
+		knownC[i] = C.int16_t(v)
+	}
+	unkC := make([]C.int8_t, len(unknownPositions))
+	for i, v := range unknownPositions {
+		unkC[i] = C.int8_t(v)
+	}
+
+	outAddrs := make([]byte, capacity*20)
+	outIdxs := make([]int64, capacity)
+	var outCount C.int
+
+	ret := C.gpu_enumerate_compute(
+		C.int64_t(startIdx),
+		C.int64_t(endIdx),
+		(*C.int16_t)(unsafe.Pointer(&knownC[0])),
+		(*C.int8_t)(unsafe.Pointer(&unkC[0])),
+		C.int8_t(len(unknownPositions)),
+		(*C.uint8_t)(unsafe.Pointer(&outAddrs[0])),
+		(*C.int64_t)(unsafe.Pointer(&outIdxs[0])),
+		C.int(capacity),
+		&outCount,
+	)
+	if int(ret) < 0 {
+		return nil, nil, fmt.Errorf("gpu_enumerate_compute failed")
+	}
+
+	cnt := int(outCount)
+	if cnt > capacity {
+		cnt = capacity
+	}
+	addresses = make([][]byte, cnt)
+	for i := range addresses {
+		addr := make([]byte, 20)
+		copy(addr, outAddrs[i*20:(i+1)*20])
+		addresses[i] = addr
+	}
+	return outIdxs[:cnt], addresses, nil
+}
+
 // Close 关闭GPU计算器
 func (g *GPUComputer) Close() error { return nil }

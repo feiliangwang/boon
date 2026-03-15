@@ -67,6 +67,16 @@ func (w *CompactWorker) SetBloomFilter(filter *bloom.Filter) {
 	w.bloomFilter = filter
 }
 
+// SetBatchSize 设置 GPU/CPU 每次 Compute 调用的批次大小
+func (w *CompactWorker) SetBatchSize(n int64) {
+	w.computer.SetBatchSize(n)
+}
+
+// SetEnumWorkers 设置枚举并发数（>1 时启用流水线：多CPU枚举→单GPU计算）
+func (w *CompactWorker) SetEnumWorkers(n int) {
+	w.computer.SetEnumWorkers(n)
+}
+
 // Start 启动Worker
 func (w *CompactWorker) Start(ctx context.Context) {
 	if !atomic.CompareAndSwapInt32(&w.running, 0, 1) {
