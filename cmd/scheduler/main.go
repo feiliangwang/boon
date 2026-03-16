@@ -39,6 +39,12 @@ type pendingTaskRecord struct {
 	endIdx   int64
 }
 
+// jobSpeedEntry 任务速度滑动窗口条目
+type jobSpeedEntry struct {
+	t       time.Time
+	indices int64
+}
+
 // Server 服务器
 type Server struct {
 	taskManager *scheduler.TaskManager
@@ -73,6 +79,9 @@ type CompactJobRunner struct {
 
 	ActiveSince       time.Time // 最近一次激活时间（启动/恢复）
 	CompletedAtActive int64     // 激活时的 CompletedIdx（用于计算当前阶段速度）
+
+	// 1分钟滑动窗口速度（jobsMu 保护）
+	speedWindow []jobSpeedEntry
 }
 
 // JobView 任务的完整视图（含实时计算字段）
@@ -197,20 +206,20 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		// 收集 runner 实时状态
 		s.jobsMu.RLock()
 		type runnerSnap struct {
-			completedIdx      int64
-			totalIdx          int64
-			running           bool
-			activeSince       time.Time
-			completedAtActive int64
+			completedIdx int64
+			totalIdx     int64
+			running      bool
+			speedWindow  []jobSpeedEntry
 		}
 		snaps := make(map[string]runnerSnap, len(s.jobs))
 		for id, r := range s.jobs {
+			win := make([]jobSpeedEntry, len(r.speedWindow))
+			copy(win, r.speedWindow)
 			snaps[id] = runnerSnap{
-				completedIdx:      r.CompletedIdx,
-				totalIdx:          r.TotalIdx,
-				running:           r.Running,
-				activeSince:       r.ActiveSince,
-				completedAtActive: r.CompletedAtActive,
+				completedIdx: r.CompletedIdx,
+				totalIdx:     r.TotalIdx,
+				running:      r.Running,
+				speedWindow:  win,
 			}
 		}
 		s.jobsMu.RUnlock()
@@ -240,18 +249,19 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 					v.ElapsedSeconds = int64(now.Sub(*job.StartedAt).Seconds())
 				}
 
-				// 速度 & ETA：仅在运行中且激活时间 > 1s 时计算
-				if snap.running && !snap.activeSince.IsZero() {
-					activeDur := now.Sub(snap.activeSince)
-					if activeDur > time.Second {
-						done := snap.completedIdx - snap.completedAtActive
-						if done > 0 {
-							v.Speed = int64(float64(done) / activeDur.Seconds())
-							remaining := snap.totalIdx - snap.completedIdx
-							if v.Speed > 0 {
-								v.ETASeconds = remaining / v.Speed
-							}
+				// 速度 & ETA：1分钟滑动窗口
+				if snap.running && len(snap.speedWindow) > 0 {
+					cutoff := now.Add(-60 * time.Second)
+					var total int64
+					for _, e := range snap.speedWindow {
+						if !e.t.Before(cutoff) {
+							total += e.indices
 						}
+					}
+					v.Speed = total / 60
+					if v.Speed > 0 {
+						remaining := snap.totalIdx - snap.completedIdx
+						v.ETASeconds = remaining / v.Speed
 					}
 				}
 			} else if job.StartedAt != nil {
@@ -566,7 +576,16 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 		s.jobsMu.Lock()
 		for jobID, runner := range s.jobs {
 			if jobID == rec.jobID {
-				runner.CompletedIdx += rec.endIdx - rec.startIdx
+				indices := rec.endIdx - rec.startIdx
+				runner.CompletedIdx += indices
+				// 记录到1分钟滑动窗口
+				now := time.Now()
+				cutoff := now.Add(-60 * time.Second)
+				i := 0
+				for i < len(runner.speedWindow) && runner.speedWindow[i].t.Before(cutoff) {
+					i++
+				}
+				runner.speedWindow = append(runner.speedWindow[i:], jobSpeedEntry{t: now, indices: indices})
 				// 安全重启点：若本 job 还有飞行中任务，取最小 StartIdx；否则取 CurrentIdx
 				if minPending, ok := committedByJob[jobID]; ok {
 					runner.CommittedIdx = minPending
@@ -721,7 +740,6 @@ func (s *Server) resumeJob(jobID string) {
 	}
 	s.taskManager.ResumeJob(jobID)
 }
-
 
 // restoreJobs 恢复任务：重建 runner 并保持暂停状态
 func (s *Server) restoreJobs() {
