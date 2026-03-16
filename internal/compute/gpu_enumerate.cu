@@ -487,16 +487,18 @@ __device__ __noinline__ void en_sha256_16(const uint8_t in[16], uint8_t out[32])
 }
 
 /* ================================================================
- * BIP39 enumerate kernel
+ * Kernel 1: BIP39 filter – lightweight, no TRON derivation.
+ * 256 threads/block, small stack (~1 KB/thread).
+ * Outputs a compact array of valid word-index sets + original indices.
  * ================================================================ */
-__global__ void tron_enumerate_kernel(
+__global__ void bip39_filter_kernel(
     int64_t        start_idx,
     int64_t        total,
     const int16_t *known_words,
     const int8_t  *unk_pos,
     int8_t         unk_count,
-    uint8_t       *out_addrs,
-    int64_t       *out_indices,
+    int16_t       *out_wi,       /* [capacity * 12] compacted word indices */
+    int64_t       *out_idx,      /* [capacity] compacted original indices  */
     int            capacity,
     int           *out_count)
 {
@@ -504,7 +506,7 @@ __global__ void tron_enumerate_kernel(
     if (tid >= total) return;
     int64_t idx = start_idx + tid;
 
-    /* Step 1: decode word indices */
+    /* Decode word indices from integer index */
     int16_t wi[12];
     for (int i = 0; i < 12; i++) wi[i] = known_words[i];
     int64_t rem = idx;
@@ -513,7 +515,7 @@ __global__ void tron_enumerate_kernel(
         rem /= 2048;
     }
 
-    /* Step 2: pack 132 bits → entropy + checksum */
+    /* Pack 132 bits → 16 bytes entropy */
     uint32_t bits = 0;
     int      bc   = 0;
     uint8_t  entropy[16];
@@ -528,12 +530,40 @@ __global__ void tron_enumerate_kernel(
     }
     uint8_t stored_cs = (uint8_t)((bits << (8 - bc)) >> 4);
 
-    /* Step 3: BIP39 checksum validation */
+    /* BIP39 checksum validation – early exit for ~93.8% of threads */
     uint8_t sha_out[32];
     en_sha256_16(entropy, sha_out);
     if ((sha_out[0] >> 4) != stored_cs) return;
 
-    /* Step 4: build mnemonic string */
+    /* Atomically reserve output slot */
+    int slot = atomicAdd(out_count, 1);
+    if (slot >= capacity) return;
+
+    /* Write compact word indices and original index */
+    for (int i = 0; i < 12; i++) out_wi[slot * 12 + i] = wi[i];
+    out_idx[slot] = idx;
+}
+
+/* ================================================================
+ * Kernel 2: TRON derive – heavy, operates only on BIP39-valid mnemonics.
+ * 32 threads/block, requires cudaLimitStackSize = 65536.
+ * 100% thread utilisation – no warp divergence.
+ * ================================================================ */
+__global__ void tron_derive_kernel(
+    const int16_t *wi_buf,      /* [count * 12] from kernel 1 */
+    const int64_t *idx_buf,     /* [count]       from kernel 1 */
+    int            count,
+    uint8_t       *out_addrs,   /* [count * 20] */
+    int64_t       *out_indices) /* [count]      */
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= count) return;
+
+    /* Read word indices */
+    int16_t wi[12];
+    for (int i = 0; i < 12; i++) wi[i] = wi_buf[(int64_t)tid * 12 + i];
+
+    /* Build mnemonic string */
     uint8_t mn[120];
     int     ml = 0;
     for (int i = 0; i < 12; i++) {
@@ -542,7 +572,7 @@ __global__ void tron_enumerate_kernel(
         for (int j = 0; j < 8 && w[j]; j++) mn[ml++] = w[j];
     }
 
-    /* Step 5: full derivation pipeline */
+    /* Full TRON derivation pipeline */
     uint8_t seed[64];
     en_pbkdf2_hmac_sha512(mn, (uint32_t)ml, seed);
 
@@ -555,12 +585,9 @@ __global__ void tron_enumerate_kernel(
     uint8_t khash[32];
     en_keccak256(pub, 64, khash);
 
-    /* Step 6: atomic store */
-    int slot = atomicAdd(out_count, 1);
-    if (slot < capacity) {
-        out_indices[slot] = idx;
-        memcpy(out_addrs + slot * 20, khash + 12, 20);
-    }
+    /* Store result */
+    out_indices[tid] = idx_buf[tid];
+    memcpy(out_addrs + (int64_t)tid * 20, khash + 12, 20);
 }
 
 /* ================================================================
@@ -582,50 +609,70 @@ int gpu_enumerate_compute(
     int64_t total = end_idx - start_idx;
     if (total <= 0) { *out_count = 0; return 0; }
 
-    int16_t *d_known   = NULL;
-    int8_t  *d_unk     = NULL;
-    uint8_t *d_addrs   = NULL;
-    int64_t *d_indices = NULL;
-    int     *d_count   = NULL;
+    int16_t *d_known       = NULL;
+    int8_t  *d_unk         = NULL;
+    int16_t *d_wi          = NULL;  /* kernel-1 output: word indices [capacity*12] */
+    int64_t *d_valid_idx   = NULL;  /* kernel-1 output: original indices [capacity] */
+    int     *d_valid_count = NULL;
+    uint8_t *d_addrs       = NULL;  /* kernel-2 output: addresses [capacity*20] */
+    int64_t *d_indices     = NULL;  /* kernel-2 output: indices   [capacity]    */
 
-    if (cudaMalloc(&d_known,   12 * sizeof(int16_t))                    != cudaSuccess) goto err;
-    if (cudaMalloc(&d_unk,     (int)unknown_count * sizeof(int8_t))     != cudaSuccess) goto err;
-    if (cudaMalloc(&d_addrs,   (size_t)capacity * 20)                   != cudaSuccess) goto err;
-    if (cudaMalloc(&d_indices, (size_t)capacity * sizeof(int64_t))      != cudaSuccess) goto err;
-    if (cudaMalloc(&d_count,   sizeof(int))                             != cudaSuccess) goto err;
+    if (cudaMalloc(&d_known,       12 * sizeof(int16_t))                     != cudaSuccess) goto err;
+    if (cudaMalloc(&d_unk,         (int)unknown_count * sizeof(int8_t))      != cudaSuccess) goto err;
+    if (cudaMalloc(&d_wi,          (size_t)capacity * 12 * sizeof(int16_t))  != cudaSuccess) goto err;
+    if (cudaMalloc(&d_valid_idx,   (size_t)capacity * sizeof(int64_t))       != cudaSuccess) goto err;
+    if (cudaMalloc(&d_valid_count, sizeof(int))                              != cudaSuccess) goto err;
+    if (cudaMalloc(&d_addrs,       (size_t)capacity * 20)                    != cudaSuccess) goto err;
+    if (cudaMalloc(&d_indices,     (size_t)capacity * sizeof(int64_t))       != cudaSuccess) goto err;
 
     cudaMemcpy(d_known, known_words, 12 * sizeof(int16_t),                cudaMemcpyHostToDevice);
     cudaMemcpy(d_unk,   unknown_pos, (int)unknown_count * sizeof(int8_t), cudaMemcpyHostToDevice);
-    cudaMemset(d_count, 0, sizeof(int));
+    cudaMemset(d_valid_count, 0, sizeof(int));
 
+    /* --- Kernel 1: BIP39 filter (small stack, 256 threads/block) --- */
+    cudaDeviceSetLimit(cudaLimitStackSize, 1024);
     {
-        cudaDeviceSetLimit(cudaLimitStackSize, 65536);
-        int bs = 32, nb = (int)((total + bs - 1) / bs);
-        tron_enumerate_kernel<<<nb, bs>>>(
+        int bs = 256, nb = (int)((total + bs - 1) / bs);
+        bip39_filter_kernel<<<nb, bs>>>(
             start_idx, total,
             d_known, d_unk, unknown_count,
-            d_addrs, d_indices, capacity, d_count);
+            d_wi, d_valid_idx, capacity, d_valid_count);
         if (cudaDeviceSynchronize() != cudaSuccess) goto err;
     }
 
+    /* Retrieve valid count; then launch Kernel 2 only if there is work */
     {
         int cnt = 0;
-        cudaMemcpy(&cnt, d_count, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&cnt, d_valid_count, sizeof(int), cudaMemcpyDeviceToHost);
         if (cnt > capacity) cnt = capacity;
         *out_count = cnt;
-        cudaMemcpy(out_addrs,   d_addrs,   (size_t)cnt * 20,              cudaMemcpyDeviceToHost);
-        cudaMemcpy(out_indices, d_indices, (size_t)cnt * sizeof(int64_t), cudaMemcpyDeviceToHost);
+
+        if (cnt > 0) {
+            /* --- Kernel 2: TRON derivation (large stack, 32 threads/block) --- */
+            cudaDeviceSetLimit(cudaLimitStackSize, 65536);
+            int bs = 32, nb = (cnt + bs - 1) / bs;
+            tron_derive_kernel<<<nb, bs>>>(
+                d_wi, d_valid_idx, cnt,
+                d_addrs, d_indices);
+            if (cudaDeviceSynchronize() != cudaSuccess) goto err;
+
+            cudaMemcpy(out_addrs,   d_addrs,   (size_t)cnt * 20,              cudaMemcpyDeviceToHost);
+            cudaMemcpy(out_indices, d_indices, (size_t)cnt * sizeof(int64_t), cudaMemcpyDeviceToHost);
+        }
     }
 
-    cudaFree(d_known); cudaFree(d_unk);
-    cudaFree(d_addrs); cudaFree(d_indices); cudaFree(d_count);
+    cudaFree(d_known);  cudaFree(d_unk);
+    cudaFree(d_wi);     cudaFree(d_valid_idx); cudaFree(d_valid_count);
+    cudaFree(d_addrs);  cudaFree(d_indices);
     return 0;
 err:
-    if (d_known)   cudaFree(d_known);
-    if (d_unk)     cudaFree(d_unk);
-    if (d_addrs)   cudaFree(d_addrs);
-    if (d_indices) cudaFree(d_indices);
-    if (d_count)   cudaFree(d_count);
+    if (d_known)       cudaFree(d_known);
+    if (d_unk)         cudaFree(d_unk);
+    if (d_wi)          cudaFree(d_wi);
+    if (d_valid_idx)   cudaFree(d_valid_idx);
+    if (d_valid_count) cudaFree(d_valid_count);
+    if (d_addrs)       cudaFree(d_addrs);
+    if (d_indices)     cudaFree(d_indices);
     return -1;
 }
 
