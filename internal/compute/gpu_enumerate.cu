@@ -118,6 +118,50 @@ __device__ void en_sha512_final(en_sha512_ctx *c, uint8_t out[64]){
     for(int i=0;i<8;i++) ec_store_be64(out+i*8,c->h[i]);
 }
 
+/* ================================================================
+ * sha512_resume_64 – zero-spill PBKDF2 inner/outer hash
+ *
+ * Computes SHA-512(state || data64), where `state` is the hash
+ * state after processing exactly 128 bytes (one full block).
+ * Total message = 128 + 64 = 192 bytes = 1536 bits.
+ *
+ * Replaces the expensive `en_sha512_ctx t = ctx_copy` pattern
+ * that causes 664 bytes of Local Memory spills per pbkdf2 call.
+ * The W schedule is built entirely in registers (no block[128]).
+ * ================================================================ */
+__device__ __forceinline__ void sha512_resume_64(
+    const uint64_t st[8], const uint8_t d[64], uint8_t out[64])
+{
+    uint64_t h0=st[0],h1=st[1],h2=st[2],h3=st[3];
+    uint64_t h4=st[4],h5=st[5],h6=st[6],h7=st[7];
+
+    /* W[0..7]: 64 bytes of data (big-endian 64-bit words)          */
+    /* W[8]   = 0x80 padding bit at byte offset 64                  */
+    /* W[9..13] = 0                                                 */
+    /* W[14]  = 0   (high 64 bits of bit-length)                    */
+    /* W[15]  = 1536 (192 bytes × 8 bits)                           */
+    uint64_t W[16];
+    for (int i = 0; i < 8; i++) W[i] = ec_load_be64(d + i * 8);
+    W[8]  = 0x8000000000000000ULL;
+    W[9]  = 0; W[10] = 0; W[11] = 0; W[12] = 0; W[13] = 0;
+    W[14] = 0; W[15] = 1536ULL;
+
+    uint64_t a=h0,b=h1,c=h2,d_=h3,e=h4,f=h5,g=h6,hh=h7;
+    #pragma unroll 8
+    for (int i = 0; i < 80; i++) {
+        if (i >= 16)
+            W[i&15] = EN_G1(W[(i-2)&15]) + EN_G0(W[(i-15)&15]) + W[(i-7)&15] + W[i&15];
+        uint64_t t1 = hh + EN_S1(e) + EN_CH(e,f,g) + EN_SHA512_K[i] + W[i&15];
+        uint64_t t2 = EN_S0(a) + EN_MAJ(a,b,c);
+        hh=g;g=f;f=e;e=d_+t1;d_=c;c=b;b=a;a=t1+t2;
+    }
+    h0+=a;h1+=b;h2+=c;h3+=d_;h4+=e;h5+=f;h6+=g;h7+=hh;
+    ec_store_be64(out,    h0); ec_store_be64(out+8,  h1);
+    ec_store_be64(out+16, h2); ec_store_be64(out+24, h3);
+    ec_store_be64(out+32, h4); ec_store_be64(out+40, h5);
+    ec_store_be64(out+48, h6); ec_store_be64(out+56, h7);
+}
+
 __device__ __noinline__ void en_hmac_sha512(
         const uint8_t *key, uint32_t klen,
         const uint8_t *msg, uint32_t mlen,
@@ -137,9 +181,7 @@ __device__ __noinline__ void en_hmac_sha512(
 __device__ __noinline__ void en_pbkdf2_hmac_sha512(
         const uint8_t *pw, uint32_t pwlen, uint8_t dk[64])
 {
-    /* Precompute ipad/opad states: 2 compressions total (once per mnemonic).
-     * Each PBKDF2 iteration then clones these states and pays only 2
-     * compressions (inner + outer), cutting 8192 → 4098 total. */
+    /* Build key block: mnemonic padded/hashed to 128 bytes */
     uint8_t k[128]; memset(k, 0, 128);
     if (pwlen > 128) {
         en_sha512_ctx t; en_sha512_init(&t);
@@ -147,24 +189,55 @@ __device__ __noinline__ void en_pbkdf2_hmac_sha512(
     } else {
         memcpy(k, pw, pwlen);
     }
-    uint8_t ipad[128], opad[128];
-    for (int i = 0; i < 128; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
 
-    en_sha512_ctx ipad_ctx, opad_ctx;
-    en_sha512_init(&ipad_ctx); en_sha512_update(&ipad_ctx, ipad, 128);
-    en_sha512_init(&opad_ctx); en_sha512_update(&opad_ctx, opad, 128);
+    /* Compute ipad/opad mid-states: compress the 128-byte pad blocks once.
+     * Store only the 8-word state (64 B), not the full ctx (200 B).
+     * This eliminates 664 B of Local Memory spills in the hot loop. */
+    uint64_t ipad_st[8], opad_st[8];
+    {
+        uint8_t pad[128];
+        for (int i = 0; i < 128; i++) pad[i] = k[i] ^ 0x36;
+        uint64_t h[8] = {
+            0x6a09e667f3bcc908ULL,0xbb67ae8584caa73bULL,
+            0x3c6ef372fe94f82bULL,0xa54ff53a5f1d36f1ULL,
+            0x510e527fade682d1ULL,0x9b05688c2b3e6c1fULL,
+            0x1f83d9abfb41bd6bULL,0x5be0cd19137e2179ULL };
+        en_sha512_compress(h, pad);
+        for (int i = 0; i < 8; i++) ipad_st[i] = h[i];
 
-    /* First HMAC: msg = "mnemonic\0\0\0\1" (12 bytes) */
-    uint8_t sb[12] = {'m','n','e','m','o','n','i','c',0,0,0,1};
+        for (int i = 0; i < 128; i++) pad[i] = k[i] ^ 0x5c;
+        h[0]=0x6a09e667f3bcc908ULL;h[1]=0xbb67ae8584caa73bULL;
+        h[2]=0x3c6ef372fe94f82bULL;h[3]=0xa54ff53a5f1d36f1ULL;
+        h[4]=0x510e527fade682d1ULL;h[5]=0x9b05688c2b3e6c1fULL;
+        h[6]=0x1f83d9abfb41bd6bULL;h[7]=0x5be0cd19137e2179ULL;
+        en_sha512_compress(h, pad);
+        for (int i = 0; i < 8; i++) opad_st[i] = h[i];
+    }
+
+    /* First HMAC: msg = "mnemonic\0\0\0\1" (12 bytes).
+     * Inner: sha512(ipad_st || salt[12]) — total 140 bytes = 1120 bits.
+     * Pad block: [salt[0..11]][0x80][zeros...][0x0000000000000460] */
     uint8_t U[64], T[64], inner[64];
-    { en_sha512_ctx t = ipad_ctx; en_sha512_update(&t, sb,    12); en_sha512_final(&t, inner); }
-    { en_sha512_ctx t = opad_ctx; en_sha512_update(&t, inner, 64); en_sha512_final(&t, U); }
+    {
+        uint64_t h[8];
+        for (int i = 0; i < 8; i++) h[i] = ipad_st[i];
+        uint8_t blk[128];
+        const uint8_t sb[12] = {'m','n','e','m','o','n','i','c',0,0,0,1};
+        for (int i = 0; i < 12; i++) blk[i] = sb[i];
+        blk[12] = 0x80;
+        for (int i = 13; i < 126; i++) blk[i] = 0;
+        blk[126] = 0x04; blk[127] = 0x60;   /* 1120 bits big-endian */
+        en_sha512_compress(h, blk);
+        for (int i = 0; i < 8; i++) ec_store_be64(inner + i*8, h[i]);
+    }
+    /* Outer: sha512(opad_st || inner[64]) via sha512_resume_64 */
+    sha512_resume_64(opad_st, inner, U);
     memcpy(T, U, 64);
 
-    /* Remaining 2047 iterations: clone precomputed states, 2 compressions each */
+    /* Hot loop: 2047 iterations, 2 compressions each (no ctx copies) */
     for (int i = 1; i < 2048; i++) {
-        { en_sha512_ctx t = ipad_ctx; en_sha512_update(&t, U,     64); en_sha512_final(&t, inner); }
-        { en_sha512_ctx t = opad_ctx; en_sha512_update(&t, inner, 64); en_sha512_final(&t, U); }
+        sha512_resume_64(ipad_st, U,     inner);
+        sha512_resume_64(opad_st, inner, U);
         for (int j = 0; j < 64; j++) T[j] ^= U[j];
     }
     memcpy(dk, T, 64);
