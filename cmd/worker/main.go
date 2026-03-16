@@ -24,7 +24,7 @@ import (
 )
 
 var (
-	schedulerURL = flag.String("scheduler", "http://localhost:8080", "调度服务器地址")
+	schedulerURL = flag.String("scheduler", "http://192.168.3.250", "调度服务器地址")
 	workerID     = flag.String("id", "", "Worker ID（留空自动生成）")
 	workers      = flag.Int("workers", runtime.NumCPU(), "并发计算线程数")
 	bloomFile    = flag.String("bloom", "account.bin.bloom", "Bloom过滤器文件（本地加载）")
@@ -33,6 +33,7 @@ var (
 	verifyN      = flag.Int("verify", 0, "验证模式：随机生成N个助记词对比GPU与CPU结果（0=禁用）")
 	benchFullN   = flag.Int64("bench-full", 0, "全链路测速：模拟完整枚举→验证→计算流程，扫描N个索引（0=禁用）")
 )
+
 func main() {
 	flag.Parse()
 
@@ -165,7 +166,7 @@ func runBench(total int, gpu bool, cpuWorkers int) {
 	fmt.Printf("\n计算引擎: %s\n", compName)
 	fmt.Printf("助记词总数: %d\n\n", total)
 
-	batchSizes := []int{1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048}
+	batchSizes := []int{2048, 2048 << 1, 2048 << 2, 2048 << 3, 2048 << 4, 2048 << 5, 2048 << 6, 2048 << 7}
 
 	// 表头
 	fmt.Printf("%-10s  %-12s  %-10s  %-14s\n", "批次大小", "已计算", "耗时", "速度(个/s)")
