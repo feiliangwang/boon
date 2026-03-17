@@ -187,11 +187,11 @@ func main() {
 	// 恢复任务
 	server.restoreJobs()
 
-	// 加载持久化的匹配结果
-	server.loadMatches()
-
-	// 加载持久化的确认成功地址
+	// 加载持久化的确认成功地址（先加载）
 	server.loadConfirmed()
+
+	// 加载持久化的匹配结果（会将已确认的同步到 confirmed 列表）
+	server.loadMatches()
 
 	// Worker清理
 	go server.cleanWorkers()
@@ -1096,7 +1096,32 @@ func (s *Server) loadMatches() {
 
 	s.matchesMu.Lock()
 	s.matches = matches
+	// 将已确认的匹配添加到 confirmed 列表（在 confirmedMu 中）
+	var confirmedFromMatches []*Match
+	for _, m := range matches {
+		if m.Exists {
+			confirmedFromMatches = append(confirmedFromMatches, m)
+		}
+	}
 	s.matchesMu.Unlock()
+
+	// 将已确认的匹配同步到 confirmed 列表
+	if len(confirmedFromMatches) > 0 {
+		s.confirmedMu.Lock()
+		// 建立地址集合，避免重复
+		existingAddrs := make(map[string]bool)
+		for _, c := range s.confirmed {
+			existingAddrs[c.Address] = true
+		}
+		for _, m := range confirmedFromMatches {
+			if !existingAddrs[m.Address] {
+				s.confirmed = append(s.confirmed, m)
+				existingAddrs[m.Address] = true
+			}
+		}
+		s.saveConfirmedLocked()
+		s.confirmedMu.Unlock()
+	}
 
 	log.Printf("[Matches] 已加载 %d 条匹配记录", len(matches))
 }
