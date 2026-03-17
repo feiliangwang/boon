@@ -804,54 +804,63 @@ __global__ void tron_derive_kernel(
 }
 
 /* ================================================================
- * Host-side persistent state
- * All buffers are allocated once and reused across calls.
- * Not thread-safe; callers must serialise (GPU mode uses 1 goroutine).
+ * Host-side persistent state – one slot per GPU device (up to MAX_DEVICES).
+ * Each DeviceState holds GPU-memory pointers allocated on the corresponding
+ * device.  All host functions call cudaSetDevice(device_id) first so that
+ * CUDA runtime operations target the correct device.
+ * Not thread-safe within a single slot; callers must serialise per-device.
  * ================================================================ */
 
-/* Persistent intermediate buffers (kernel 1 → kernel 2) */
-static int16_t *g_d_wi          = NULL;
-static int64_t *g_d_valid_idx   = NULL;
-static int     *g_d_valid_count = NULL;
-/* Persistent output buffers (kernel 2 → host) */
-static uint8_t *g_d_addrs       = NULL;
-static int64_t *g_d_indices     = NULL;
-static int     *g_d_out_count   = NULL;  /* for bloom-filtered output count */
-static int64_t  g_buf_capacity  = 0;     /* capacity of the buffers above  */
+#define MAX_DEVICES 8
 
-/* Persistent Bloom filter on GPU */
-static uint64_t *g_d_bloom  = NULL;
-static uint64_t  g_bloom_m  = 0;
-static uint32_t  g_bloom_k  = 0;
+typedef struct {
+    /* Intermediate buffers (kernel 1 → kernel 2) */
+    int16_t *d_wi;
+    int64_t *d_valid_idx;
+    int     *d_valid_count;
+    /* Output buffers (kernel 2 → host) */
+    uint8_t *d_addrs;
+    int64_t *d_indices;
+    int     *d_out_count;   /* bloom-filtered output count */
+    int64_t  buf_capacity;
+    /* Persistent Bloom filter */
+    uint64_t *d_bloom;
+    uint64_t  bloom_m;
+    uint32_t  bloom_k;
+} DeviceState;
 
-/* Ensure persistent buffers are (re-)allocated for given capacity */
-static int ensure_buffers(int64_t capacity)
+/* Zero-initialised: all pointers NULL, all counts 0. */
+static DeviceState g_dev[MAX_DEVICES];
+
+/* Ensure persistent buffers are (re-)allocated for the given device/capacity */
+static int ensure_buffers(int device_id, int64_t capacity)
 {
-    if (capacity <= g_buf_capacity) return 0;
+    DeviceState *ds = &g_dev[device_id];
+    if (capacity <= ds->buf_capacity) return 0;
     /* Free old buffers */
-    if (g_d_wi)          { cudaFree(g_d_wi);          g_d_wi          = NULL; }
-    if (g_d_valid_idx)   { cudaFree(g_d_valid_idx);   g_d_valid_idx   = NULL; }
-    if (g_d_valid_count) { cudaFree(g_d_valid_count); g_d_valid_count = NULL; }
-    if (g_d_addrs)       { cudaFree(g_d_addrs);       g_d_addrs       = NULL; }
-    if (g_d_indices)     { cudaFree(g_d_indices);     g_d_indices     = NULL; }
-    if (g_d_out_count)   { cudaFree(g_d_out_count);   g_d_out_count   = NULL; }
-    g_buf_capacity = 0;
+    if (ds->d_wi)          { cudaFree(ds->d_wi);          ds->d_wi          = NULL; }
+    if (ds->d_valid_idx)   { cudaFree(ds->d_valid_idx);   ds->d_valid_idx   = NULL; }
+    if (ds->d_valid_count) { cudaFree(ds->d_valid_count); ds->d_valid_count = NULL; }
+    if (ds->d_addrs)       { cudaFree(ds->d_addrs);       ds->d_addrs       = NULL; }
+    if (ds->d_indices)     { cudaFree(ds->d_indices);     ds->d_indices     = NULL; }
+    if (ds->d_out_count)   { cudaFree(ds->d_out_count);   ds->d_out_count   = NULL; }
+    ds->buf_capacity = 0;
 
-    if (cudaMalloc(&g_d_wi,          (size_t)capacity * 12 * sizeof(int16_t)) != cudaSuccess) goto fail;
-    if (cudaMalloc(&g_d_valid_idx,   (size_t)capacity * sizeof(int64_t))      != cudaSuccess) goto fail;
-    if (cudaMalloc(&g_d_valid_count, sizeof(int))                             != cudaSuccess) goto fail;
-    if (cudaMalloc(&g_d_addrs,       (size_t)capacity * 20)                   != cudaSuccess) goto fail;
-    if (cudaMalloc(&g_d_indices,     (size_t)capacity * sizeof(int64_t))      != cudaSuccess) goto fail;
-    if (cudaMalloc(&g_d_out_count,   sizeof(int))                             != cudaSuccess) goto fail;
-    g_buf_capacity = capacity;
+    if (cudaMalloc(&ds->d_wi,          (size_t)capacity * 12 * sizeof(int16_t)) != cudaSuccess) goto fail;
+    if (cudaMalloc(&ds->d_valid_idx,   (size_t)capacity * sizeof(int64_t))      != cudaSuccess) goto fail;
+    if (cudaMalloc(&ds->d_valid_count, sizeof(int))                             != cudaSuccess) goto fail;
+    if (cudaMalloc(&ds->d_addrs,       (size_t)capacity * 20)                   != cudaSuccess) goto fail;
+    if (cudaMalloc(&ds->d_indices,     (size_t)capacity * sizeof(int64_t))      != cudaSuccess) goto fail;
+    if (cudaMalloc(&ds->d_out_count,   sizeof(int))                             != cudaSuccess) goto fail;
+    ds->buf_capacity = capacity;
     return 0;
 fail:
-    if (g_d_wi)          { cudaFree(g_d_wi);          g_d_wi          = NULL; }
-    if (g_d_valid_idx)   { cudaFree(g_d_valid_idx);   g_d_valid_idx   = NULL; }
-    if (g_d_valid_count) { cudaFree(g_d_valid_count); g_d_valid_count = NULL; }
-    if (g_d_addrs)       { cudaFree(g_d_addrs);       g_d_addrs       = NULL; }
-    if (g_d_indices)     { cudaFree(g_d_indices);     g_d_indices     = NULL; }
-    if (g_d_out_count)   { cudaFree(g_d_out_count);   g_d_out_count   = NULL; }
+    if (ds->d_wi)          { cudaFree(ds->d_wi);          ds->d_wi          = NULL; }
+    if (ds->d_valid_idx)   { cudaFree(ds->d_valid_idx);   ds->d_valid_idx   = NULL; }
+    if (ds->d_valid_count) { cudaFree(ds->d_valid_count); ds->d_valid_count = NULL; }
+    if (ds->d_addrs)       { cudaFree(ds->d_addrs);       ds->d_addrs       = NULL; }
+    if (ds->d_indices)     { cudaFree(ds->d_indices);     ds->d_indices     = NULL; }
+    if (ds->d_out_count)   { cudaFree(ds->d_out_count);   ds->d_out_count   = NULL; }
     return -1;
 }
 
@@ -861,6 +870,7 @@ fail:
 extern "C" {
 
 int gpu_enumerate_compute(
+    int            device_id,
     int64_t        start_idx,
     int64_t        end_idx,
     const int16_t *known_words,
@@ -871,6 +881,9 @@ int gpu_enumerate_compute(
     int            capacity,
     int           *out_count)
 {
+    if (cudaSetDevice(device_id) != cudaSuccess) return -1;
+    DeviceState *ds = &g_dev[device_id];
+
     int64_t total = end_idx - start_idx;
     if (total <= 0) { *out_count = 0; return 0; }
 
@@ -878,7 +891,7 @@ int gpu_enumerate_compute(
      * Also set the device stack limit once here; both kernels share the same
      * 65536-byte limit – Kernel 1 over-allocates (uses only ~400 bytes) but
      * avoids the expensive per-call cudaDeviceSetLimit + implicit sync. */
-    if (ensure_buffers((int64_t)capacity) != 0) return -1;
+    if (ensure_buffers(device_id, (int64_t)capacity) != 0) return -1;
     cudaDeviceSetLimit(cudaLimitStackSize, 65536);
 
     /* Per-call small allocations: template only (12*2 + unk*1 bytes, tiny) */
@@ -889,7 +902,7 @@ int gpu_enumerate_compute(
 
     cudaMemcpy(d_known, known_words, 12 * sizeof(int16_t),                cudaMemcpyHostToDevice);
     cudaMemcpy(d_unk,   unknown_pos, (int)unknown_count * sizeof(int8_t), cudaMemcpyHostToDevice);
-    cudaMemset(g_d_valid_count, 0, sizeof(int));
+    cudaMemset(ds->d_valid_count, 0, sizeof(int));
 
     /* --- Kernel 1: BIP39 filter (256 threads/block) --- */
     {
@@ -897,7 +910,7 @@ int gpu_enumerate_compute(
         bip39_filter_kernel<<<nb, bs>>>(
             start_idx, total,
             d_known, d_unk, unknown_count,
-            g_d_wi, g_d_valid_idx, capacity, g_d_valid_count);
+            ds->d_wi, ds->d_valid_idx, capacity, ds->d_valid_count);
         if (cudaDeviceSynchronize() != cudaSuccess) goto err;
     }
 
@@ -907,29 +920,29 @@ int gpu_enumerate_compute(
     /* Retrieve valid count */
     {
         int cnt = 0;
-        cudaMemcpy(&cnt, g_d_valid_count, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&cnt, ds->d_valid_count, sizeof(int), cudaMemcpyDeviceToHost);
         if (cnt > capacity) cnt = capacity;
 
         if (cnt > 0) {
             /* --- Kernel 2: TRON derivation (32 threads/block) --- */
             int out_cnt;
-            if (g_d_bloom) {
+            if (ds->d_bloom) {
                 /* Bloom mode: output only matching addresses */
-                cudaMemset(g_d_out_count, 0, sizeof(int));
+                cudaMemset(ds->d_out_count, 0, sizeof(int));
                 int bs = 32, nb = (cnt + bs - 1) / bs;
                 tron_derive_kernel<<<nb, bs>>>(
-                    g_d_wi, g_d_valid_idx, cnt,
-                    g_d_addrs, g_d_indices, g_d_out_count,
-                    g_d_bloom, g_bloom_m, g_bloom_k);
+                    ds->d_wi, ds->d_valid_idx, cnt,
+                    ds->d_addrs, ds->d_indices, ds->d_out_count,
+                    ds->d_bloom, ds->bloom_m, ds->bloom_k);
                 if (cudaDeviceSynchronize() != cudaSuccess) return -1;
-                cudaMemcpy(&out_cnt, g_d_out_count, sizeof(int), cudaMemcpyDeviceToHost);
+                cudaMemcpy(&out_cnt, ds->d_out_count, sizeof(int), cudaMemcpyDeviceToHost);
                 if (out_cnt > capacity) out_cnt = capacity;
             } else {
                 /* No bloom: write all cnt results */
                 int bs = 32, nb = (cnt + bs - 1) / bs;
                 tron_derive_kernel<<<nb, bs>>>(
-                    g_d_wi, g_d_valid_idx, cnt,
-                    g_d_addrs, g_d_indices, NULL,
+                    ds->d_wi, ds->d_valid_idx, cnt,
+                    ds->d_addrs, ds->d_indices, NULL,
                     NULL, 0, 0);
                 if (cudaDeviceSynchronize() != cudaSuccess) return -1;
                 out_cnt = cnt;
@@ -937,8 +950,8 @@ int gpu_enumerate_compute(
 
             *out_count = out_cnt;
             if (out_cnt > 0) {
-                cudaMemcpy(out_addrs,   g_d_addrs,   (size_t)out_cnt * 20,              cudaMemcpyDeviceToHost);
-                cudaMemcpy(out_indices, g_d_indices, (size_t)out_cnt * sizeof(int64_t), cudaMemcpyDeviceToHost);
+                cudaMemcpy(out_addrs,   ds->d_addrs,   (size_t)out_cnt * 20,              cudaMemcpyDeviceToHost);
+                cudaMemcpy(out_indices, ds->d_indices, (size_t)out_cnt * sizeof(int64_t), cudaMemcpyDeviceToHost);
             }
         } else {
             *out_count = 0;
@@ -952,29 +965,29 @@ err:
     return -1;
 }
 
-/* Upload bloom filter to GPU persistent memory.
- * words: raw uint64 bitset from BloomFilter.BitSet().Bytes()
- * word_count: len(words)
- * m: total bits (BloomFilter.Cap())
- * k: hash functions (BloomFilter.K()) */
-int gpu_bloom_upload(const uint64_t *words, uint64_t word_count, uint64_t m, uint32_t k)
+/* Upload bloom filter to GPU persistent memory for the specified device. */
+int gpu_bloom_upload(int device_id, const uint64_t *words, uint64_t word_count, uint64_t m, uint32_t k)
 {
-    if (g_d_bloom) { cudaFree(g_d_bloom); g_d_bloom = NULL; }
-    if (cudaMalloc(&g_d_bloom, word_count * sizeof(uint64_t)) != cudaSuccess) return -1;
-    if (cudaMemcpy(g_d_bloom, words, word_count * sizeof(uint64_t),
+    if (cudaSetDevice(device_id) != cudaSuccess) return -1;
+    DeviceState *ds = &g_dev[device_id];
+    if (ds->d_bloom) { cudaFree(ds->d_bloom); ds->d_bloom = NULL; }
+    if (cudaMalloc(&ds->d_bloom, word_count * sizeof(uint64_t)) != cudaSuccess) return -1;
+    if (cudaMemcpy(ds->d_bloom, words, word_count * sizeof(uint64_t),
                    cudaMemcpyHostToDevice) != cudaSuccess) {
-        cudaFree(g_d_bloom); g_d_bloom = NULL; return -1;
+        cudaFree(ds->d_bloom); ds->d_bloom = NULL; return -1;
     }
-    g_bloom_m = m;
-    g_bloom_k = k;
+    ds->bloom_m = m;
+    ds->bloom_k = k;
     return 0;
 }
 
-/* Release GPU bloom filter memory */
-void gpu_bloom_free(void)
+/* Release GPU bloom filter memory for the specified device */
+void gpu_bloom_free(int device_id)
 {
-    if (g_d_bloom) { cudaFree(g_d_bloom); g_d_bloom = NULL; }
-    g_bloom_m = 0; g_bloom_k = 0;
+    if (cudaSetDevice(device_id) != cudaSuccess) return;
+    DeviceState *ds = &g_dev[device_id];
+    if (ds->d_bloom) { cudaFree(ds->d_bloom); ds->d_bloom = NULL; }
+    ds->bloom_m = 0; ds->bloom_k = 0;
 }
 
 /* Kernel: test a single address against GPU bloom filter */
@@ -984,11 +997,13 @@ __global__ void bloom_test_kernel(const uint8_t *addr, int *result,
     *result = bloom_test(addr, bits, m, k);
 }
 
-/* Test a 20-byte address against the currently-uploaded GPU bloom filter.
+/* Test a 20-byte address against the bloom filter on the specified device.
  * Returns 1 if present, 0 if absent, -1 if no filter loaded. */
-int gpu_bloom_test_addr(const uint8_t *addr20)
+int gpu_bloom_test_addr(int device_id, const uint8_t *addr20)
 {
-    if (!g_d_bloom) return -1;
+    if (cudaSetDevice(device_id) != cudaSuccess) return -1;
+    DeviceState *ds = &g_dev[device_id];
+    if (!ds->d_bloom) return -1;
 
     uint8_t *d_addr = NULL;
     int     *d_result = NULL;
@@ -1001,7 +1016,7 @@ int gpu_bloom_test_addr(const uint8_t *addr20)
     cudaMemcpy(d_addr, addr20, 20, cudaMemcpyHostToDevice);
     cudaMemset(d_result, 0, sizeof(int));
 
-    bloom_test_kernel<<<1, 1>>>(d_addr, d_result, g_d_bloom, g_bloom_m, g_bloom_k);
+    bloom_test_kernel<<<1, 1>>>(d_addr, d_result, ds->d_bloom, ds->bloom_m, ds->bloom_k);
     cudaDeviceSynchronize();
     cudaMemcpy(&h_result, d_result, sizeof(int), cudaMemcpyDeviceToHost);
 
@@ -1040,8 +1055,9 @@ __global__ void bip39_debug_kernel(const int16_t *wi_in, uint8_t *out_stored, ui
     /* (re-using out_sha as entropy[0] is enough; caller checks sha[0]>>4) */
 }
 
-int gpu_bip39_debug(const int16_t wi[12], uint8_t *stored_cs_out, uint8_t *sha0_out)
+int gpu_bip39_debug(int device_id, const int16_t wi[12], uint8_t *stored_cs_out, uint8_t *sha0_out)
 {
+    if (cudaSetDevice(device_id) != cudaSuccess) return -1;
     int16_t *d_wi = NULL;
     uint8_t *d_stored = NULL, *d_sha = NULL;
     if (cudaMalloc(&d_wi,     12 * sizeof(int16_t)) != cudaSuccess) return -1;
@@ -1058,17 +1074,19 @@ int gpu_bip39_debug(const int16_t wi[12], uint8_t *stored_cs_out, uint8_t *sha0_
     return 0;
 }
 
-/* Release all persistent GPU buffers (call on shutdown) */
-void gpu_enumerate_cleanup(void)
+/* Release all persistent GPU buffers for the specified device (call on shutdown) */
+void gpu_enumerate_cleanup(int device_id)
 {
-    gpu_bloom_free();
-    if (g_d_wi)          { cudaFree(g_d_wi);          g_d_wi          = NULL; }
-    if (g_d_valid_idx)   { cudaFree(g_d_valid_idx);   g_d_valid_idx   = NULL; }
-    if (g_d_valid_count) { cudaFree(g_d_valid_count); g_d_valid_count = NULL; }
-    if (g_d_addrs)       { cudaFree(g_d_addrs);       g_d_addrs       = NULL; }
-    if (g_d_indices)     { cudaFree(g_d_indices);     g_d_indices     = NULL; }
-    if (g_d_out_count)   { cudaFree(g_d_out_count);   g_d_out_count   = NULL; }
-    g_buf_capacity = 0;
+    if (cudaSetDevice(device_id) != cudaSuccess) return;
+    gpu_bloom_free(device_id);
+    DeviceState *ds = &g_dev[device_id];
+    if (ds->d_wi)          { cudaFree(ds->d_wi);          ds->d_wi          = NULL; }
+    if (ds->d_valid_idx)   { cudaFree(ds->d_valid_idx);   ds->d_valid_idx   = NULL; }
+    if (ds->d_valid_count) { cudaFree(ds->d_valid_count); ds->d_valid_count = NULL; }
+    if (ds->d_addrs)       { cudaFree(ds->d_addrs);       ds->d_addrs       = NULL; }
+    if (ds->d_indices)     { cudaFree(ds->d_indices);     ds->d_indices     = NULL; }
+    if (ds->d_out_count)   { cudaFree(ds->d_out_count);   ds->d_out_count   = NULL; }
+    ds->buf_capacity = 0;
 }
 
 
