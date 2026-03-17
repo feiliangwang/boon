@@ -19,6 +19,7 @@ import (
 
 	"boon/internal/account"
 	"boon/internal/bip44"
+	"boon/internal/compute"
 	"boon/internal/mnemonic"
 	"boon/internal/protocol"
 	"boon/internal/scheduler"
@@ -70,7 +71,9 @@ type Server struct {
 	workersMu         sync.RWMutex
 	activeWorkerCount int // 当前在线 worker 数，变化时重置 job 速度窗口
 
-	accountDb *account.Db // 账户数据库，用于检查地址是否存在
+	accountDb      *account.Db          // 账户数据库，用于检查地址是否存在
+	seedComputer   compute.SeedComputer // 用于验证提交的地址
+	verificationMu sync.Mutex           // 保护 seedComputer
 }
 
 // CompactJobRunner 紧凑任务运行器
@@ -171,6 +174,7 @@ func main() {
 		pendingTasks:  make(map[int64]pendingTaskRecord),
 		workers:       make(map[string]*WorkerInfo),
 		confirmed:     make([]*Match, 0),
+		seedComputer:  compute.NewCPUComputer(), // 用于验证提交的地址
 	}
 
 	// 初始化账户数据库
@@ -638,11 +642,13 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	//检查是否有错误数据
+
+	// 检查是否有错误数据（index == 0 是无效的）
 	for _, item := range result.Matches {
 		if item.Index == 0 {
+			log.Printf("[Submit] Worker %s 提交了无效数据 (index=0)，拒绝并保留缺口", workerID)
 			w.WriteHeader(http.StatusOK)
-			return
+			return // 不删除 pending task，等待超时后自动加入缺口
 		}
 	}
 
@@ -654,70 +660,117 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	s.workersMu.Unlock()
 
-	// 更新 CompletedIdx 和 CommittedIdx
+	// 获取 pending task 记录（但不立即删除）
 	s.pendingTasksMu.Lock()
 	rec, found := s.pendingTasks[result.TaskID]
-	if found {
-		delete(s.pendingTasks, result.TaskID)
-		// 删除持久化的 pending task
-		s.taskManager.CompletePendingTask(result.TaskID)
+	s.pendingTasksMu.Unlock()
+
+	if !found {
+		// 任务不存在（可能已超时被加入缺口），直接返回
+		w.WriteHeader(http.StatusOK)
+		return
 	}
-	// 计算此 job 的连续完成前沿：飞行中任务的最小 StartIdx
-	// 若无飞行中任务，则安全点 = CurrentIdx
+
+	// ============================================================
+	// 验证阶段：先验证所有匹配，再决定是否标记任务完成
+	// ============================================================
+	validMatches := make([]protocol.MatchData, 0, len(result.Matches))
+	verificationFailed := false
+
+	for _, match := range result.Matches {
+		// 1. 验证索引范围
+		if match.Index < rec.startIdx || match.Index >= rec.endIdx {
+			log.Printf("[Verify] ❌ Worker %s 提交的索引超出范围! index=%d, range=[%d,%d)",
+				workerID, match.Index, rec.startIdx, rec.endIdx)
+			verificationFailed = true
+			continue
+		}
+
+		mnemonicStr := s.indexToMnemonic(result.TaskID, match.Index)
+
+		// 2. 验证地址正确性
+		if !s.verifyMatch(mnemonicStr, match.Address) {
+			log.Printf("[Verify] ❌ Worker %s 提交的数据验证失败! index=%d, submittedAddr=%x",
+				workerID, match.Index, match.Address)
+			verificationFailed = true
+			continue
+		}
+
+		validMatches = append(validMatches, match)
+	}
+
+	// 如果有验证失败，不删除 pending task，让它自然超时后加入缺口队列
+	// pending task 已持久化，超时机制会将其加入 gaps（也会持久化恢复）
+	if verificationFailed {
+		log.Printf("[Verify] ⚠️ Worker %s 提交验证失败，索引 [%d, %d) 将等待超时后加入缺口队列",
+			workerID, rec.startIdx, rec.endIdx)
+		// 不删除 pending task，保留让它超时后自动处理
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// ============================================================
+	// 验证通过，标记任务完成
+	// ============================================================
+	s.pendingTasksMu.Lock()
+	delete(s.pendingTasks, result.TaskID)
+	s.taskManager.CompletePendingTask(result.TaskID)
+	// 计算此 job 的连续完成前沿
 	committedByJob := make(map[string]int64)
-	for _, r := range s.pendingTasks {
+	for taskID, r := range s.pendingTasks {
+		if taskID == result.TaskID {
+			continue
+		}
 		if cur, ok := committedByJob[r.jobID]; !ok || r.startIdx < cur {
 			committedByJob[r.jobID] = r.startIdx
 		}
 	}
 	s.pendingTasksMu.Unlock()
 
-	if found {
-		s.jobsMu.Lock()
-		for jobID, runner := range s.jobs {
-			if jobID == rec.jobID {
-				indices := rec.endIdx - rec.startIdx
-				runner.CompletedIdx += indices
-				// 记录到1分钟滑动窗口（使用实际计算耗时，消除批次提交造成的波动）
-				now := time.Now()
-				taskDur := now.Sub(rec.fetchedAt)
-				if taskDur <= 0 {
-					taskDur = time.Millisecond
-				}
-				cutoff := now.Add(-60 * time.Second)
-				i := 0
-				for i < len(runner.speedWindow) && runner.speedWindow[i].t.Before(cutoff) {
-					i++
-				}
-				runner.speedWindow = append(runner.speedWindow[i:], jobSpeedEntry{t: now, indices: indices, duration: taskDur})
-				// 更新安全重启点（用于 UI 显示）
-				if minPending, ok := committedByJob[jobID]; ok {
-					runner.CommittedIdx = minPending
-				} else {
-					runner.CommittedIdx = runner.CurrentIdx
-				}
-				// 持久化 CurrentIdx（而非 CommittedIdx），确保重启后不丢失已分发但未提交的任务
-				// 代价是可能有少量重复计算，但不会丢失任务
-				s.taskManager.SetCompleted(jobID, runner.CurrentIdx)
-
-				// 清理重叠的缺口（任务已完成，即使是从缺口分配的也无需再填补）
-				runner.gaps = removeOverlappingGaps(runner.gaps, rec.startIdx, rec.endIdx)
-
-				// 检查是否全部完成
-				if runner.CommittedIdx >= runner.TotalIdx {
-					runner.Running = false
-					delete(s.jobs, jobID)
-					s.taskManager.CompleteJob(jobID)
-					log.Printf("任务完成: %s 总计=%d", jobID, runner.TotalIdx)
-				}
-				break
+	s.jobsMu.Lock()
+	for jobID, runner := range s.jobs {
+		if jobID == rec.jobID {
+			indices := rec.endIdx - rec.startIdx
+			runner.CompletedIdx += indices
+			// 记录到1分钟滑动窗口
+			now := time.Now()
+			taskDur := now.Sub(rec.fetchedAt)
+			if taskDur <= 0 {
+				taskDur = time.Millisecond
 			}
-		}
-		s.jobsMu.Unlock()
-	}
+			cutoff := now.Add(-60 * time.Second)
+			i := 0
+			for i < len(runner.speedWindow) && runner.speedWindow[i].t.Before(cutoff) {
+				i++
+			}
+			runner.speedWindow = append(runner.speedWindow[i:], jobSpeedEntry{t: now, indices: indices, duration: taskDur})
+			// 更新安全重启点
+			if minPending, ok := committedByJob[jobID]; ok {
+				runner.CommittedIdx = minPending
+			} else {
+				runner.CommittedIdx = runner.CurrentIdx
+			}
+			s.taskManager.SetCompleted(jobID, runner.CurrentIdx)
 
-	// 处理匹配
-	for _, match := range result.Matches {
+			// 清理重叠的缺口
+			runner.gaps = removeOverlappingGaps(runner.gaps, rec.startIdx, rec.endIdx)
+
+			// 检查是否全部完成
+			if runner.CommittedIdx >= runner.TotalIdx {
+				runner.Running = false
+				delete(s.jobs, jobID)
+				s.taskManager.CompleteJob(jobID)
+				log.Printf("任务完成: %s 总计=%d", jobID, runner.TotalIdx)
+			}
+			break
+		}
+	}
+	s.jobsMu.Unlock()
+
+	// ============================================================
+	// 处理有效匹配
+	// ============================================================
+	for _, match := range validMatches {
 		mnemonicStr := s.indexToMnemonic(result.TaskID, match.Index)
 		tronAddr := bip44.GetTronAddress(match.Address)
 
@@ -734,11 +787,11 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 		s.saveMatchesLocked()
 		s.matchesMu.Unlock()
 
-		log.Printf("========== 匹配 ==========")
+		log.Printf("========== 匹配 ✅已验证 ==========")
 		log.Printf("Worker: %s", workerID)
 		log.Printf("助记词: %s", mnemonicStr)
 		log.Printf("地址: %s", tronAddr)
-		log.Printf("==========================")
+		log.Printf("====================================")
 
 		// 后台异步确认账户状态
 		go s.confirmMatch(m)
@@ -1181,6 +1234,28 @@ func extractJobNum(jobID string) int64 {
 	var num int64
 	fmt.Sscanf(jobID, "job-%d", &num)
 	return num
+}
+
+// verifyMatch 验证提交的地址是否正确（重新计算地址并比较）
+func (s *Server) verifyMatch(mnemonicStr string, submittedAddr []byte) bool {
+	s.verificationMu.Lock()
+	defer s.verificationMu.Unlock()
+
+	// 使用 CPU 计算器重新计算地址
+	computedAddrs := s.seedComputer.Compute([]string{mnemonicStr})
+	if len(computedAddrs) == 0 || len(computedAddrs[0]) != 20 {
+		log.Printf("[Verify] 计算地址失败: mnemonic=%s", mnemonicStr)
+		return false
+	}
+
+	// 比较计算结果与提交的地址
+	computedAddr := computedAddrs[0]
+	if !bytes.Equal(computedAddr, submittedAddr) {
+		log.Printf("[Verify] 地址不匹配! computed=%x, submitted=%x", computedAddr, submittedAddr)
+		return false
+	}
+
+	return true
 }
 
 // confirmMatch 检查账户是否存在于本地数据库中
