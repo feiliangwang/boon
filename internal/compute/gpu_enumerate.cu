@@ -827,6 +827,11 @@ typedef struct {
     int16_t *d_wi;
     int64_t *d_valid_idx;
     int     *d_valid_count;
+    /* Persistent template buffers */
+    int16_t *d_known;
+    int8_t  *d_unk;
+    int      unk_capacity;
+    int      stack_limit_set;
     /* Output buffers (kernel 2 → host) */
     uint8_t *d_addrs;
     int64_t *d_indices;
@@ -873,6 +878,31 @@ fail:
     return -1;
 }
 
+static int ensure_template_buffers(int device_id, int8_t unknown_count)
+{
+    DeviceState *ds = &g_dev[device_id];
+
+    if (!ds->d_known) {
+        if (cudaMalloc(&ds->d_known, 12 * sizeof(int16_t)) != cudaSuccess) return -1;
+    }
+
+    if ((int)unknown_count > ds->unk_capacity) {
+        if (ds->d_unk) { cudaFree(ds->d_unk); ds->d_unk = NULL; }
+        ds->unk_capacity = 0;
+        if (unknown_count > 0) {
+            if (cudaMalloc(&ds->d_unk, (int)unknown_count * sizeof(int8_t)) != cudaSuccess) return -1;
+            ds->unk_capacity = (int)unknown_count;
+        }
+    }
+
+    if (!ds->stack_limit_set) {
+        if (cudaDeviceSetLimit(cudaLimitStackSize, 65536) != cudaSuccess) return -1;
+        ds->stack_limit_set = 1;
+    }
+
+    return 0;
+}
+
 /* ================================================================
  * Host functions
  * ================================================================ */
@@ -899,16 +929,14 @@ extern "C" int gpu_enumerate_compute(
      * 65536-byte limit – Kernel 1 over-allocates (uses only ~400 bytes) but
      * avoids the expensive per-call cudaDeviceSetLimit + implicit sync. */
     if (ensure_buffers(device_id, (int64_t)capacity) != 0) return -1;
-    cudaDeviceSetLimit(cudaLimitStackSize, 65536);
+    if (ensure_template_buffers(device_id, unknown_count) != 0) return -1;
 
-    /* Per-call small allocations: template only (12*2 + unk*1 bytes, tiny) */
-    int16_t *d_known = NULL;
-    int8_t  *d_unk   = NULL;
-    if (cudaMalloc(&d_known, 12 * sizeof(int16_t))               != cudaSuccess) goto err;
-    if (cudaMalloc(&d_unk,   (int)unknown_count * sizeof(int8_t)) != cudaSuccess) goto err;
-
-    cudaMemcpy(d_known, known_words, 12 * sizeof(int16_t),                cudaMemcpyHostToDevice);
-    cudaMemcpy(d_unk,   unknown_pos, (int)unknown_count * sizeof(int8_t), cudaMemcpyHostToDevice);
+    if (cudaMemcpy(ds->d_known, known_words, 12 * sizeof(int16_t), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (unknown_count > 0) {
+        if (cudaMemcpy(ds->d_unk, unknown_pos, (int)unknown_count * sizeof(int8_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            return -1;
+        }
+    }
     cudaMemset(ds->d_valid_count, 0, sizeof(int));
 
     /* --- Kernel 1: BIP39 filter (256 threads/block) --- */
@@ -916,13 +944,10 @@ extern "C" int gpu_enumerate_compute(
         int bs = 256, nb = (int)((total + bs - 1) / bs);
         bip39_filter_kernel<<<nb, bs>>>(
             start_idx, total,
-            d_known, d_unk, unknown_count,
+            ds->d_known, ds->d_unk, unknown_count,
             ds->d_wi, ds->d_valid_idx, capacity, ds->d_valid_count);
-        if (cudaDeviceSynchronize() != cudaSuccess) goto err;
+        if (cudaDeviceSynchronize() != cudaSuccess) return -1;
     }
-
-    cudaFree(d_known); d_known = NULL;
-    cudaFree(d_unk);   d_unk   = NULL;
 
     /* Retrieve valid count */
     {
@@ -966,10 +991,6 @@ extern "C" int gpu_enumerate_compute(
     }
 
     return 0;
-err:
-    if (d_known) cudaFree(d_known);
-    if (d_unk)   cudaFree(d_unk);
-    return -1;
 }
 
 /* Upload bloom filter to GPU persistent memory for the specified device. */
@@ -1091,9 +1112,13 @@ extern "C" void gpu_enumerate_cleanup(int device_id)
     if (ds->d_wi)          { cudaFree(ds->d_wi);          ds->d_wi          = NULL; }
     if (ds->d_valid_idx)   { cudaFree(ds->d_valid_idx);   ds->d_valid_idx   = NULL; }
     if (ds->d_valid_count) { cudaFree(ds->d_valid_count); ds->d_valid_count = NULL; }
+    if (ds->d_known)       { cudaFree(ds->d_known);       ds->d_known       = NULL; }
+    if (ds->d_unk)         { cudaFree(ds->d_unk);         ds->d_unk         = NULL; }
     if (ds->d_addrs)       { cudaFree(ds->d_addrs);       ds->d_addrs       = NULL; }
     if (ds->d_indices)     { cudaFree(ds->d_indices);     ds->d_indices     = NULL; }
     if (ds->d_out_count)   { cudaFree(ds->d_out_count);   ds->d_out_count   = NULL; }
+    ds->unk_capacity = 0;
+    ds->stack_limit_set = 0;
     ds->buf_capacity = 0;
 }
 

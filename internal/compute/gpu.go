@@ -18,7 +18,8 @@ import (
 
 // GPUComputer GPU计算器（CUDA版本）
 type GPUComputer struct {
-	deviceID int
+	deviceID   int
+	bloomOnGPU bool
 }
 
 // GPUDeviceCount 返回可用 CUDA 设备数量
@@ -156,6 +157,12 @@ func (g *GPUComputer) EnumerateCompute(
 	return outIdxs[:cnt:cnt], addressViews(outAddrs, cnt), nil
 }
 
+// BloomFilterOnGPU reports whether this GPU computer currently has a bloom
+// filter uploaded and can therefore filter enumerate results on-device.
+func (g *GPUComputer) BloomFilterOnGPU() bool {
+	return g.bloomOnGPU
+}
+
 func addressViews(buf []byte, count int) [][]byte {
 	if count <= 0 {
 		return nil
@@ -175,6 +182,7 @@ func addressViews(buf []byte, count int) [][]byte {
 func (g *GPUComputer) UploadBloomFilter(f *bloom.Filter) error {
 	words, m, k := f.RawBits()
 	if len(words) == 0 {
+		g.bloomOnGPU = false
 		return nil
 	}
 	ret := C.gpu_bloom_upload(
@@ -185,8 +193,10 @@ func (g *GPUComputer) UploadBloomFilter(f *bloom.Filter) error {
 		C.uint32_t(k),
 	)
 	if int(ret) < 0 {
+		g.bloomOnGPU = false
 		return fmt.Errorf("gpu_bloom_upload failed (device %d)", g.deviceID)
 	}
+	g.bloomOnGPU = true
 	return nil
 }
 
@@ -222,5 +232,6 @@ func (g *GPUComputer) BIP39Debug(wordIndices [12]int16) (storedCS, sha0 byte, er
 // Close 关闭GPU计算器，释放持久化GPU内存
 func (g *GPUComputer) Close() error {
 	C.gpu_enumerate_cleanup(C.int(g.deviceID))
+	g.bloomOnGPU = false
 	return nil
 }

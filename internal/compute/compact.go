@@ -23,6 +23,10 @@ type rangeEnumerator interface {
 	EnumerateCompute(startIdx, endIdx int64, knownWordIndices []int16, unknownPositions []int8) ([]int64, [][]byte, error)
 }
 
+type gpuBloomEnumerator interface {
+	BloomFilterOnGPU() bool
+}
+
 // CompactComputer 紧凑计算器
 type CompactComputer struct {
 	workers     int
@@ -97,6 +101,11 @@ func (c *CompactComputer) computeRangeGPUNative(
 		Matches: make([]protocol.MatchData, 0),
 	}
 
+	effectiveBloom := bloomFilter
+	if gbe, ok := c.computer.(gpuBloomEnumerator); ok && gbe.BloomFilterOnGPU() {
+		effectiveBloom = nil
+	}
+
 	known, unkPos := ie.TemplateIndices()
 	batchSize := c.batchSize
 
@@ -112,7 +121,7 @@ func (c *CompactComputer) computeRangeGPUNative(
 			eb := c.enumerateBatch(enum, start, end)
 			cpuAddrs := c.computer.Compute(eb.mnemonics)
 			for i, addr := range cpuAddrs {
-				if bloomFilter != nil && !bloomFilter(addr) {
+				if effectiveBloom != nil && !effectiveBloom(addr) {
 					continue
 				}
 				result.Matches = append(result.Matches, protocol.MatchData{
@@ -124,7 +133,7 @@ func (c *CompactComputer) computeRangeGPUNative(
 		}
 
 		for i, addr := range addrs {
-			if bloomFilter != nil && !bloomFilter(addr) {
+			if effectiveBloom != nil && !effectiveBloom(addr) {
 				continue
 			}
 			result.Matches = append(result.Matches, protocol.MatchData{
