@@ -49,19 +49,24 @@ bloomtool:
 	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/bloomtool ./cmd/bloomtool
 
 # 编译CUDA静态库（独立编译：每个 .cu 自包含，避免 ptxas 跨 kernel 干扰）
-internal/compute/libgpu_cuda.a: internal/compute/gpu.cu internal/compute/gpu_enumerate.cu internal/compute/gpu_bridge.h
+internal/compute/libgpu_cuda.a: internal/compute/gpu_runtime.cu internal/compute/gpu_batch.cu internal/compute/gpu_enumerate.cu internal/compute/gpu_bridge.h
 	$(NVCC) -O2 -arch=$(CUDA_ARCH) --compiler-options -fPIC \
 		-I$(CUDA_INCLUDE) \
-		-c internal/compute/gpu.cu \
-		-o internal/compute/gpu.o
+		-c internal/compute/gpu_runtime.cu \
+		-o internal/compute/gpu_runtime.o
+	$(NVCC) -O2 -arch=$(CUDA_ARCH) --compiler-options -fPIC \
+		-I$(CUDA_INCLUDE) \
+		-c internal/compute/gpu_batch.cu \
+		-o internal/compute/gpu_batch.o
 	$(NVCC) -O2 -arch=$(CUDA_ARCH) --compiler-options -fPIC \
 		-I$(CUDA_INCLUDE) \
 		-c internal/compute/gpu_enumerate.cu \
 		-o internal/compute/gpu_enumerate.o
 	ar rcs internal/compute/libgpu_cuda.a \
-		internal/compute/gpu.o \
+		internal/compute/gpu_runtime.o \
+		internal/compute/gpu_batch.o \
 		internal/compute/gpu_enumerate.o
-	rm -f internal/compute/gpu.o internal/compute/gpu_enumerate.o
+	rm -f internal/compute/gpu_runtime.o internal/compute/gpu_batch.o internal/compute/gpu_enumerate.o
 
 # GPU版本Worker
 worker-gpu: internal/compute/libgpu_cuda.a

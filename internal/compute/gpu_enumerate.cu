@@ -7,7 +7,7 @@
  *
  * Without RDC, each .cu file gets its own complete device code image.
  * ptxas sees only the kernels in THIS file, so tron_enumerate_kernel's
- * heavy register usage cannot interfere with tron_kernel in gpu.cu.
+ * heavy register usage cannot interfere with the batch kernel in gpu_batch.cu.
  */
 
 #include <cuda_runtime.h>
@@ -679,6 +679,14 @@ __device__ int bloom_test(const uint8_t *addr,
     return 1;
 }
 
+/*
+ * The batch pipeline reuses the shared device-side implementation from this
+ * file by compiling it with GPU_ENUMERATE_SHARED_ONLY defined. Keep the
+ * enumerate-specific kernels and host entry points below that guard so the
+ * batch translation unit only pulls in the common helpers.
+ */
+#ifndef GPU_ENUMERATE_SHARED_ONLY
+
 /* ================================================================
  * Kernel 1: BIP39 filter – lightweight, no TRON derivation.
  * 256 threads/block, small stack (~1 KB/thread).
@@ -1085,3 +1093,5 @@ extern "C" void gpu_enumerate_cleanup(int device_id)
     if (ds->d_out_count)   { cudaFree(ds->d_out_count);   ds->d_out_count   = NULL; }
     ds->buf_capacity = 0;
 }
+
+#endif  /* GPU_ENUMERATE_SHARED_ONLY */
