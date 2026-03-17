@@ -138,7 +138,7 @@ extern "C" int gpu_compute_addresses(
     if (cudaMemcpy(state->d_len, mnemonic_lengths, (size_t)count * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
 
     {
-        int block_size = 32;
+        int block_size = 256;
         int num_blocks = (count + block_size - 1) / block_size;
         tron_batch_kernel<<<num_blocks, block_size>>>(
             state->d_data, state->d_off, state->d_len, count, state->d_out);
