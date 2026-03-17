@@ -7,6 +7,8 @@ extern "C" {
 
 /* Returns number of CUDA-capable devices (0 if none). */
 int gpu_device_count(void);
+/* Returns the maximum number of device slots supported by the CUDA bridge. */
+int gpu_max_devices(void);
 
 /*
  * Compute TRON addresses from mnemonics on the specified GPU device.

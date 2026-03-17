@@ -101,9 +101,11 @@ func (c *CompactComputer) computeRangeGPUNative(
 		Matches: make([]protocol.MatchData, 0),
 	}
 
-	effectiveBloom := bloomFilter
-	if gbe, ok := c.computer.(gpuBloomEnumerator); ok && gbe.BloomFilterOnGPU() {
-		effectiveBloom = nil
+	gpuBloomActive := false
+	if bloomFilter != nil {
+		if gbe, ok := c.computer.(gpuBloomEnumerator); ok && gbe.BloomFilterOnGPU() {
+			gpuBloomActive = true
+		}
 	}
 
 	known, unkPos := ie.TemplateIndices()
@@ -121,7 +123,7 @@ func (c *CompactComputer) computeRangeGPUNative(
 			eb := c.enumerateBatch(enum, start, end)
 			cpuAddrs := c.computer.Compute(eb.mnemonics)
 			for i, addr := range cpuAddrs {
-				if effectiveBloom != nil && !effectiveBloom(addr) {
+				if bloomFilter != nil && !bloomFilter(addr) {
 					continue
 				}
 				result.Matches = append(result.Matches, protocol.MatchData{
@@ -133,7 +135,7 @@ func (c *CompactComputer) computeRangeGPUNative(
 		}
 
 		for i, addr := range addrs {
-			if effectiveBloom != nil && !effectiveBloom(addr) {
+			if !gpuBloomActive && bloomFilter != nil && !bloomFilter(addr) {
 				continue
 			}
 			result.Matches = append(result.Matches, protocol.MatchData{

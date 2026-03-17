@@ -14,7 +14,7 @@ import (
 
 // speedEntry 速度滑动窗口条目
 type speedEntry struct {
-	t        time.Time     // 任务提交时间（用于窗口裁剪）
+	t        time.Time // 任务提交时间（用于窗口裁剪）
 	indices  int64
 	duration time.Duration // 实际计算耗时
 }
@@ -75,7 +75,15 @@ func NewCompactWorkerWithComputer(id string, client *CompactClient, workers int,
 // SetBloomFilter 设置Bloom过滤器；如果计算引擎支持 GPU 上传则同步上传到 GPU 显存
 func (w *CompactWorker) SetBloomFilter(filter *bloom.Filter) {
 	w.bloomFilter = filter
+	type bloomClearer interface {
+		ClearBloomFilter() error
+	}
 	if filter == nil {
+		if clr, ok := w.computer.GetSeedComputer().(bloomClearer); ok {
+			if err := clr.ClearBloomFilter(); err != nil {
+				log.Printf("[Worker] GPU bloom clear failed: %v", err)
+			}
+		}
 		return
 	}
 	// If the underlying computer supports GPU bloom upload, do it now.

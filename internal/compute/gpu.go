@@ -22,14 +22,23 @@ type GPUComputer struct {
 	bloomOnGPU bool
 }
 
+func supportedGPUDeviceCount() int {
+	n := int(C.gpu_device_count())
+	maxSlots := int(C.gpu_max_devices())
+	if n < maxSlots {
+		return n
+	}
+	return maxSlots
+}
+
 // GPUDeviceCount 返回可用 CUDA 设备数量
 func GPUDeviceCount() int {
-	return int(C.gpu_device_count())
+	return supportedGPUDeviceCount()
 }
 
 // NewGPUComputer 创建指定设备的GPU计算器
 func NewGPUComputer(deviceID int) (*GPUComputer, error) {
-	n := int(C.gpu_device_count())
+	n := supportedGPUDeviceCount()
 	if n <= 0 {
 		return nil, fmt.Errorf("no CUDA-capable devices found")
 	}
@@ -41,7 +50,7 @@ func NewGPUComputer(deviceID int) (*GPUComputer, error) {
 
 // NewGPUComputerAll 创建所有可用 GPU 设备的计算器列表
 func NewGPUComputerAll() ([]*GPUComputer, error) {
-	n := int(C.gpu_device_count())
+	n := supportedGPUDeviceCount()
 	if n <= 0 {
 		return nil, fmt.Errorf("no CUDA-capable devices found")
 	}
@@ -182,8 +191,7 @@ func addressViews(buf []byte, count int) [][]byte {
 func (g *GPUComputer) UploadBloomFilter(f *bloom.Filter) error {
 	words, m, k := f.RawBits()
 	if len(words) == 0 {
-		g.bloomOnGPU = false
-		return nil
+		return g.ClearBloomFilter()
 	}
 	ret := C.gpu_bloom_upload(
 		C.int(g.deviceID),
@@ -197,6 +205,13 @@ func (g *GPUComputer) UploadBloomFilter(f *bloom.Filter) error {
 		return fmt.Errorf("gpu_bloom_upload failed (device %d)", g.deviceID)
 	}
 	g.bloomOnGPU = true
+	return nil
+}
+
+// ClearBloomFilter releases the currently uploaded bloom filter on this device.
+func (g *GPUComputer) ClearBloomFilter() error {
+	C.gpu_bloom_free(C.int(g.deviceID))
+	g.bloomOnGPU = false
 	return nil
 }
 
