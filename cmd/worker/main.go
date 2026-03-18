@@ -355,17 +355,153 @@ func runBench(total int, gpu bool, cpuWorkers int) {
 	fmt.Println()
 }
 
+type gpuBenchRunner struct {
+	deviceID  int
+	mnemonics []string
+	gpu       *compute.GPUComputer
+}
+
+type pbkdf2SeedBenchResult struct {
+	deviceID int
+	count    int
+	elapsed  time.Duration
+	seeds    []byte
+}
+
+type pbkdf2KernelBenchResult struct {
+	deviceID int
+	count    int
+	elapsed  time.Duration
+	kernelMs float64
+	sample   uint64
+}
+
+type pbkdf2KernelBenchFunc func(*compute.GPUComputer, []string) (float64, uint64, bool)
+
+func splitBenchmarkWork(total int, deviceIDs []int) []gpuBenchRunner {
+	if total <= 0 || len(deviceIDs) == 0 {
+		return nil
+	}
+
+	usedDevices := deviceIDs
+	if len(usedDevices) > total {
+		usedDevices = usedDevices[:total]
+	}
+
+	base := total / len(usedDevices)
+	rem := total % len(usedDevices)
+	start := 0
+	runners := make([]gpuBenchRunner, 0, len(usedDevices))
+	for i, deviceID := range usedDevices {
+		count := base
+		if i < rem {
+			count++
+		}
+		end := start + count
+		if count > 0 {
+			runners = append(runners, gpuBenchRunner{
+				deviceID:  deviceID,
+				mnemonics: nil,
+				gpu:       nil,
+			})
+		}
+		start = end
+	}
+	return runners
+}
+
+func prepareGPUBenchRunners(deviceIDs []int, mnemonics []string) ([]gpuBenchRunner, error) {
+	runners := splitBenchmarkWork(len(mnemonics), deviceIDs)
+	start := 0
+	for i := range runners {
+		count := len(mnemonics) / len(runners)
+		if i < len(mnemonics)%len(runners) {
+			count++
+		}
+		end := start + count
+
+		gpuComp, err := compute.NewGPUComputer(runners[i].deviceID)
+		if err != nil {
+			closeGPUBenchRunners(runners)
+			return nil, fmt.Errorf("GPU %d 初始化失败: %w", runners[i].deviceID, err)
+		}
+
+		runners[i].gpu = gpuComp
+		runners[i].mnemonics = mnemonics[start:end]
+
+		warmupN := 32
+		if warmupN > len(runners[i].mnemonics) {
+			warmupN = len(runners[i].mnemonics)
+		}
+		if warmupN > 0 {
+			seeds := gpuComp.ComputePBKDF2Seeds(runners[i].mnemonics[:warmupN])
+			if len(seeds) != warmupN*64 {
+				closeGPUBenchRunners(runners)
+				return nil, fmt.Errorf("GPU %d warmup 失败", runners[i].deviceID)
+			}
+		}
+
+		start = end
+	}
+	return runners, nil
+}
+
+func closeGPUBenchRunners(runners []gpuBenchRunner) {
+	for _, runner := range runners {
+		if runner.gpu != nil {
+			_ = runner.gpu.Close()
+		}
+	}
+}
+
+func formatGPUDevicesLabel(runners []gpuBenchRunner) string {
+	if len(runners) == 1 {
+		return fmt.Sprintf("GPU(device %d)", runners[0].deviceID)
+	}
+	ids := make([]string, len(runners))
+	for i, runner := range runners {
+		ids[i] = strconv.Itoa(runner.deviceID)
+	}
+	return fmt.Sprintf("GPU x%d (devices %s)", len(runners), strings.Join(ids, ","))
+}
+
+func printPBKDF2SeedBenchDetails(results []pbkdf2SeedBenchResult) {
+	if len(results) <= 1 {
+		return
+	}
+	fmt.Printf("设备明细:\n")
+	for _, result := range results {
+		speed := float64(result.count) / result.elapsed.Seconds()
+		fmt.Printf("  GPU %d: %d 个, %s, %.1f kH/s\n",
+			result.deviceID, result.count, fmtDuration(result.elapsed), speed/1000.0)
+	}
+}
+
+func printPBKDF2KernelBenchDetails(results []pbkdf2KernelBenchResult, opFactor int) {
+	if len(results) <= 1 {
+		return
+	}
+	fmt.Printf("设备明细:\n")
+	for _, result := range results {
+		speed := float64(result.count*opFactor) / (result.kernelMs / 1000.0)
+		fmt.Printf("  GPU %d: %d 个, kernel %.3fms, %.1f kH/s, sample=%016x\n",
+			result.deviceID, result.count, result.kernelMs, speed/1000.0, result.sample)
+	}
+}
+
+func sampleDigest(results []pbkdf2KernelBenchResult) string {
+	h := sha256.New()
+	for _, result := range results {
+		fmt.Fprintf(h, "%d:%016x;", result.deviceID, result.sample)
+	}
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:8])
+}
+
 func runPBKDF2Bench(total int, deviceIDs []int) {
 	if len(deviceIDs) == 0 {
 		log.Fatalf("bench-pbkdf2 需要 GPU，请使用 -gpu 或 -gpu-devices")
 	}
-
-	deviceID := deviceIDs[0]
-	gpuComp, err := compute.NewGPUComputer(deviceID)
-	if err != nil {
-		log.Fatalf("GPU初始化失败: %v\n提示: 需要 CUDA 构建且有可用 GPU", err)
-	}
-	defer gpuComp.Close()
 
 	fmt.Printf("生成 %d 个随机助记词...\n", total)
 	mnemonics, err := genMnemonics(total)
@@ -373,33 +509,60 @@ func runPBKDF2Bench(total int, deviceIDs []int) {
 		log.Fatalf("生成助记词失败: %v", err)
 	}
 
-	warmupN := 32
-	if warmupN > total {
-		warmupN = total
+	runners, err := prepareGPUBenchRunners(deviceIDs, mnemonics)
+	if err != nil {
+		log.Fatalf("%v\n提示: 需要 CUDA 构建且有可用 GPU", err)
 	}
-	if warmupN > 0 {
-		if seeds := gpuComp.ComputePBKDF2Seeds(mnemonics[:warmupN]); len(seeds) == 0 {
-			log.Fatalf("PBKDF2 warmup 失败")
-		}
-	}
+	defer closeGPUBenchRunners(runners)
 
 	fmt.Printf("\nPBKDF2-only 性能分析\n")
-	fmt.Printf("计算引擎: GPU(device %d)\n", deviceID)
+	fmt.Printf("计算引擎: %s\n", formatGPUDevicesLabel(runners))
 	fmt.Printf("算法: PBKDF2-HMAC-SHA512(2048)\n")
 	fmt.Printf("助记词总数: %d\n\n", total)
 
+	results := make([]pbkdf2SeedBenchResult, len(runners))
+	errCh := make(chan error, len(runners))
+	var wg sync.WaitGroup
 	start := time.Now()
-	seeds := gpuComp.ComputePBKDF2Seeds(mnemonics)
+	for i, runner := range runners {
+		wg.Add(1)
+		go func(i int, runner gpuBenchRunner) {
+			defer wg.Done()
+			localStart := time.Now()
+			seeds := runner.gpu.ComputePBKDF2Seeds(runner.mnemonics)
+			elapsed := time.Since(localStart)
+			if len(seeds) != len(runner.mnemonics)*64 {
+				errCh <- fmt.Errorf("GPU %d benchmark 失败: 返回长度=%d，期望=%d", runner.deviceID, len(seeds), len(runner.mnemonics)*64)
+				return
+			}
+			results[i] = pbkdf2SeedBenchResult{
+				deviceID: runner.deviceID,
+				count:    len(runner.mnemonics),
+				elapsed:  elapsed,
+				seeds:    seeds,
+			}
+		}(i, runner)
+	}
+	wg.Wait()
 	elapsed := time.Since(start)
-	if len(seeds) != total*64 {
-		log.Fatalf("PBKDF2 benchmark 失败: 返回长度=%d，期望=%d", len(seeds), total*64)
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
 	}
 
-	sum := sha256.Sum256(seeds)
+	h := sha256.New()
+	for _, result := range results {
+		_, _ = h.Write(result.seeds)
+	}
+	sum := h.Sum(nil)
 	speed := float64(total) / elapsed.Seconds()
 	fmt.Printf("总耗时: %s\n", fmtDuration(elapsed))
 	fmt.Printf("速度: %.0f 个/s  (%.1f kH/s)\n", speed, speed/1000.0)
-	fmt.Printf("校验: %s\n\n", hex.EncodeToString(sum[:8]))
+	fmt.Printf("校验: %s\n", hex.EncodeToString(sum[:8]))
+	printPBKDF2SeedBenchDetails(results)
+	fmt.Printf("\n")
 }
 
 func runPBKDF2KernelBench(total int, deviceIDs []int) {
@@ -407,49 +570,75 @@ func runPBKDF2KernelBench(total int, deviceIDs []int) {
 		log.Fatalf("bench-pbkdf2-kernel 需要 GPU，请使用 -gpu 或 -gpu-devices")
 	}
 
-	deviceID := deviceIDs[0]
-	gpuComp, err := compute.NewGPUComputer(deviceID)
-	if err != nil {
-		log.Fatalf("GPU初始化失败: %v\n提示: 需要 CUDA 构建且有可用 GPU", err)
-	}
-	defer gpuComp.Close()
-
 	fmt.Printf("生成 %d 个随机助记词...\n", total)
 	mnemonics, err := genMnemonics(total)
 	if err != nil {
 		log.Fatalf("生成助记词失败: %v", err)
 	}
 
-	warmupN := 32
-	if warmupN > total {
-		warmupN = total
+	runners, err := prepareGPUBenchRunners(deviceIDs, mnemonics)
+	if err != nil {
+		log.Fatalf("%v\n提示: 需要 CUDA 构建且有可用 GPU", err)
 	}
-	if warmupN > 0 {
-		if seeds := gpuComp.ComputePBKDF2Seeds(mnemonics[:warmupN]); len(seeds) == 0 {
-			log.Fatalf("PBKDF2 kernel warmup 失败")
-		}
-	}
+	defer closeGPUBenchRunners(runners)
 
 	rounds := 1
 	for rounds < 32 && total*rounds < 262144 {
 		rounds <<= 1
 	}
 
-	kernelMs, sample, ok := gpuComp.BenchmarkPBKDF2Kernel(mnemonics, rounds)
-	if !ok || kernelMs <= 0 {
-		log.Fatalf("PBKDF2 kernel benchmark 失败")
+	results := make([]pbkdf2KernelBenchResult, len(runners))
+	errCh := make(chan error, len(runners))
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i, runner := range runners {
+		wg.Add(1)
+		go func(i int, runner gpuBenchRunner) {
+			defer wg.Done()
+			localStart := time.Now()
+			kernelMs, sample, ok := runner.gpu.BenchmarkPBKDF2Kernel(runner.mnemonics, rounds)
+			elapsed := time.Since(localStart)
+			if !ok || kernelMs <= 0 {
+				errCh <- fmt.Errorf("GPU %d kernel benchmark 失败", runner.deviceID)
+				return
+			}
+			results[i] = pbkdf2KernelBenchResult{
+				deviceID: runner.deviceID,
+				count:    len(runner.mnemonics),
+				elapsed:  elapsed,
+				kernelMs: kernelMs,
+				sample:   sample,
+			}
+		}(i, runner)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
 	}
 
 	totalOps := float64(total * rounds)
-	speed := totalOps / (kernelMs / 1000.0)
+	speed := totalOps / elapsed.Seconds()
+	maxKernelMs := 0.0
+	for _, result := range results {
+		if result.kernelMs > maxKernelMs {
+			maxKernelMs = result.kernelMs
+		}
+	}
 	fmt.Printf("\nPBKDF2 纯内核性能分析\n")
-	fmt.Printf("计算引擎: GPU(device %d)\n", deviceID)
+	fmt.Printf("计算引擎: %s\n", formatGPUDevicesLabel(runners))
 	fmt.Printf("算法: PBKDF2-HMAC-SHA512(2048)\n")
 	fmt.Printf("助记词总数: %d\n", total)
 	fmt.Printf("计时轮数: %d\n\n", rounds)
-	fmt.Printf("Kernel总耗时: %.3fms\n", kernelMs)
+	fmt.Printf("并行总耗时: %s\n", fmtDuration(elapsed))
+	fmt.Printf("最长设备Kernel耗时: %.3fms\n", maxKernelMs)
 	fmt.Printf("速度: %.0f 个/s  (%.1f kH/s)\n", speed, speed/1000.0)
-	fmt.Printf("样本: %016x\n\n", sample)
+	fmt.Printf("样本校验: %s\n", sampleDigest(results))
+	printPBKDF2KernelBenchDetails(results, rounds)
+	fmt.Printf("\n")
 }
 
 func runPBKDF2CoreBench(total int, deviceIDs []int) {
@@ -457,49 +646,75 @@ func runPBKDF2CoreBench(total int, deviceIDs []int) {
 		log.Fatalf("bench-pbkdf2-core 需要 GPU，请使用 -gpu 或 -gpu-devices")
 	}
 
-	deviceID := deviceIDs[0]
-	gpuComp, err := compute.NewGPUComputer(deviceID)
-	if err != nil {
-		log.Fatalf("GPU初始化失败: %v\n提示: 需要 CUDA 构建且有可用 GPU", err)
-	}
-	defer gpuComp.Close()
-
 	fmt.Printf("生成 %d 个随机助记词...\n", total)
 	mnemonics, err := genMnemonics(total)
 	if err != nil {
 		log.Fatalf("生成助记词失败: %v", err)
 	}
 
-	warmupN := 32
-	if warmupN > total {
-		warmupN = total
+	runners, err := prepareGPUBenchRunners(deviceIDs, mnemonics)
+	if err != nil {
+		log.Fatalf("%v\n提示: 需要 CUDA 构建且有可用 GPU", err)
 	}
-	if warmupN > 0 {
-		if seeds := gpuComp.ComputePBKDF2Seeds(mnemonics[:warmupN]); len(seeds) == 0 {
-			log.Fatalf("PBKDF2 core warmup 失败")
-		}
-	}
+	defer closeGPUBenchRunners(runners)
 
 	rounds := 1
 	for rounds < 32 && total*rounds < 262144 {
 		rounds <<= 1
 	}
 
-	kernelMs, sample, ok := gpuComp.BenchmarkPBKDF2CoreKernel(mnemonics, rounds)
-	if !ok || kernelMs <= 0 {
-		log.Fatalf("PBKDF2 core benchmark 失败")
+	results := make([]pbkdf2KernelBenchResult, len(runners))
+	errCh := make(chan error, len(runners))
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i, runner := range runners {
+		wg.Add(1)
+		go func(i int, runner gpuBenchRunner) {
+			defer wg.Done()
+			localStart := time.Now()
+			kernelMs, sample, ok := runner.gpu.BenchmarkPBKDF2CoreKernel(runner.mnemonics, rounds)
+			elapsed := time.Since(localStart)
+			if !ok || kernelMs <= 0 {
+				errCh <- fmt.Errorf("GPU %d core benchmark 失败", runner.deviceID)
+				return
+			}
+			results[i] = pbkdf2KernelBenchResult{
+				deviceID: runner.deviceID,
+				count:    len(runner.mnemonics),
+				elapsed:  elapsed,
+				kernelMs: kernelMs,
+				sample:   sample,
+			}
+		}(i, runner)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
 	}
 
 	totalOps := float64(total * rounds)
-	speed := totalOps / (kernelMs / 1000.0)
+	speed := totalOps / elapsed.Seconds()
+	maxKernelMs := 0.0
+	for _, result := range results {
+		if result.kernelMs > maxKernelMs {
+			maxKernelMs = result.kernelMs
+		}
+	}
 	fmt.Printf("\nPBKDF2 核心性能分析\n")
-	fmt.Printf("计算引擎: GPU(device %d)\n", deviceID)
+	fmt.Printf("计算引擎: %s\n", formatGPUDevicesLabel(runners))
 	fmt.Printf("算法: PBKDF2-HMAC-SHA512(2048)\n")
 	fmt.Printf("助记词总数: %d\n", total)
 	fmt.Printf("计时轮数: %d\n\n", rounds)
-	fmt.Printf("Kernel总耗时: %.3fms\n", kernelMs)
+	fmt.Printf("并行总耗时: %s\n", fmtDuration(elapsed))
+	fmt.Printf("最长设备Kernel耗时: %.3fms\n", maxKernelMs)
 	fmt.Printf("速度: %.0f 个/s  (%.1f kH/s)\n", speed, speed/1000.0)
-	fmt.Printf("样本: %016x\n\n", sample)
+	fmt.Printf("样本校验: %s\n", sampleDigest(results))
+	printPBKDF2KernelBenchDetails(results, rounds)
+	fmt.Printf("\n")
 }
 
 func runPBKDF2LoopBench(total int, deviceIDs []int) {
@@ -507,44 +722,70 @@ func runPBKDF2LoopBench(total int, deviceIDs []int) {
 		log.Fatalf("bench-pbkdf2-loop 需要 GPU，请使用 -gpu 或 -gpu-devices")
 	}
 
-	deviceID := deviceIDs[0]
-	gpuComp, err := compute.NewGPUComputer(deviceID)
-	if err != nil {
-		log.Fatalf("GPU初始化失败: %v\n提示: 需要 CUDA 构建且有可用 GPU", err)
-	}
-	defer gpuComp.Close()
-
 	fmt.Printf("生成 %d 个随机助记词...\n", total)
 	mnemonics, err := genMnemonics(total)
 	if err != nil {
 		log.Fatalf("生成助记词失败: %v", err)
 	}
 
-	warmupN := 32
-	if warmupN > total {
-		warmupN = total
+	runners, err := prepareGPUBenchRunners(deviceIDs, mnemonics)
+	if err != nil {
+		log.Fatalf("%v\n提示: 需要 CUDA 构建且有可用 GPU", err)
 	}
-	if warmupN > 0 {
-		if seeds := gpuComp.ComputePBKDF2Seeds(mnemonics[:warmupN]); len(seeds) == 0 {
-			log.Fatalf("PBKDF2 loop warmup 失败")
+	defer closeGPUBenchRunners(runners)
+
+	const loopsPerLaunch = 64
+	results := make([]pbkdf2KernelBenchResult, len(runners))
+	errCh := make(chan error, len(runners))
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i, runner := range runners {
+		wg.Add(1)
+		go func(i int, runner gpuBenchRunner) {
+			defer wg.Done()
+			localStart := time.Now()
+			kernelMs, sample, ok := runner.gpu.BenchmarkPBKDF2LoopKernel(runner.mnemonics, loopsPerLaunch)
+			elapsed := time.Since(localStart)
+			if !ok || kernelMs <= 0 {
+				errCh <- fmt.Errorf("GPU %d loop benchmark 失败", runner.deviceID)
+				return
+			}
+			results[i] = pbkdf2KernelBenchResult{
+				deviceID: runner.deviceID,
+				count:    len(runner.mnemonics),
+				elapsed:  elapsed,
+				kernelMs: kernelMs,
+				sample:   sample,
+			}
+		}(i, runner)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			log.Fatalf("%v", err)
 		}
 	}
 
-	const loopsPerLaunch = 64
-	kernelMs, sample, ok := gpuComp.BenchmarkPBKDF2LoopKernel(mnemonics, loopsPerLaunch)
-	if !ok || kernelMs <= 0 {
-		log.Fatalf("PBKDF2 loop benchmark 失败")
+	speed := float64(total) / elapsed.Seconds()
+	maxKernelMs := 0.0
+	for _, result := range results {
+		if result.kernelMs > maxKernelMs {
+			maxKernelMs = result.kernelMs
+		}
 	}
-
-	speed := float64(total) / (kernelMs / 1000.0)
 	fmt.Printf("\nPBKDF2 分段loop性能分析\n")
-	fmt.Printf("计算引擎: GPU(device %d)\n", deviceID)
+	fmt.Printf("计算引擎: %s\n", formatGPUDevicesLabel(runners))
 	fmt.Printf("算法: PBKDF2-HMAC-SHA512(2048)\n")
 	fmt.Printf("助记词总数: %d\n", total)
 	fmt.Printf("每次launch迭代数: %d\n\n", loopsPerLaunch)
-	fmt.Printf("Kernel总耗时: %.3fms\n", kernelMs)
+	fmt.Printf("并行总耗时: %s\n", fmtDuration(elapsed))
+	fmt.Printf("最长设备Kernel耗时: %.3fms\n", maxKernelMs)
 	fmt.Printf("速度: %.0f 个/s  (%.1f kH/s)\n", speed, speed/1000.0)
-	fmt.Printf("样本: %016x\n\n", sample)
+	fmt.Printf("样本校验: %s\n", sampleDigest(results))
+	printPBKDF2KernelBenchDetails(results, 1)
+	fmt.Printf("\n")
 }
 
 // ================================================================

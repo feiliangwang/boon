@@ -2,10 +2,16 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
 	"embed"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
@@ -29,9 +35,10 @@ import (
 var staticFS embed.FS
 
 var (
-	dataDir   = flag.String("data", "./data", "数据目录")
-	port      = flag.Int("port", 8080, "HTTP服务端口")
-	accountDb = flag.String("accountdb", "", "账户数据库路径（LevelDB）")
+	dataDir    = flag.String("data", "./data", "数据目录")
+	port       = flag.Int("port", 8080, "HTTP服务端口")
+	accountDb  = flag.String("accountdb", "", "账户数据库路径（LevelDB）")
+	pubkeyFile = flag.String("pubkey", "", "RSA 公钥文件路径（PEM），启用后助记词加密存储，服务端不留明文")
 )
 
 // pendingTaskRecord 记录已分发但尚未提交结果的任务
@@ -52,8 +59,9 @@ type jobSpeedEntry struct {
 // Server 服务器
 type Server struct {
 	taskManager   *scheduler.TaskManager
-	matchesFile   string // 匹配结果持久化文件路径
-	confirmedFile string // 确认成功的地址持久化文件路径
+	matchesFile   string         // 匹配结果持久化文件路径
+	confirmedFile string         // 确认成功的地址持久化文件路径
+	pubKey        *rsa.PublicKey // RSA 公钥，非 nil 时启用助记词加密；服务端无私钥，无法解密
 
 	jobs   map[string]*CompactJobRunner
 	jobsMu sync.RWMutex
@@ -147,17 +155,81 @@ const (
 
 // Match 匹配结果
 type Match struct {
-	JobID      string    `json:"job_id"`
-	Mnemonic   string    `json:"mnemonic"`
-	Address    string    `json:"address"`      // TRON Base58Check 地址
-	RawAddrHex string    `json:"raw_addr_hex"` // 20字节地址的 hex 编码，用于重启后恢复查询能力
-	Time       time.Time `json:"time"`
-	Exists     bool      `json:"exists"` // 账户是否存在于数据库中
-	rawAddr    []byte    // 运行时原始20字节地址（从 RawAddrHex 恢复）
+	JobID             string    `json:"job_id"`
+	Mnemonic          string    `json:"mnemonic,omitempty"`           // 明文（未启用公钥时）
+	EncryptedMnemonic string    `json:"encrypted_mnemonic,omitempty"` // RSA-OAEP base64（启用公钥后），服务端不可解密
+	Address           string    `json:"address"`                      // TRON Base58Check 地址
+	RawAddrHex        string    `json:"raw_addr_hex"`                 // 20字节地址的 hex 编码，用于重启后恢复查询能力
+	Time              time.Time `json:"time"`
+	Exists            bool      `json:"exists"` // 账户是否存在于数据库中
+	rawAddr           []byte    // 运行时原始20字节地址（从 RawAddrHex 恢复）
+}
+
+// MatchView API 响应用，不暴露 RawAddrHex 等内部字段
+type MatchView struct {
+	JobID             string    `json:"job_id"`
+	Mnemonic          string    `json:"mnemonic,omitempty"`
+	EncryptedMnemonic string    `json:"encrypted_mnemonic,omitempty"`
+	Address           string    `json:"address"`
+	Time              time.Time `json:"time"`
+	Exists            bool      `json:"exists"`
+}
+
+func matchToView(m *Match) MatchView {
+	return MatchView{
+		JobID:             m.JobID,
+		Mnemonic:          m.Mnemonic,
+		EncryptedMnemonic: m.EncryptedMnemonic,
+		Address:           m.Address,
+		Time:              m.Time,
+		Exists:            m.Exists,
+	}
+}
+
+// loadRSAPublicKey 从 PEM 文件加载 RSA 公钥（PKIX/SubjectPublicKeyInfo 格式）
+func loadRSAPublicKey(path string) (*rsa.PublicKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取公钥文件失败: %w", err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("无法解析 PEM 块")
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("解析公钥失败: %w", err)
+	}
+	rsaPub, ok := pub.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("公钥不是 RSA 类型")
+	}
+	return rsaPub, nil
+}
+
+// encryptMnemonicRSA 使用 RSA-OAEP-SHA256 加密助记词，返回 base64 密文
+// 加密后服务端不保留明文；只有持有对应私钥的人可解密。
+func encryptMnemonicRSA(pub *rsa.PublicKey, plaintext string) (string, error) {
+	ct, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, pub, []byte(plaintext), nil)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(ct), nil
 }
 
 func main() {
 	flag.Parse()
+
+	// 加载 RSA 公钥（可选）
+	var pubKey *rsa.PublicKey
+	if *pubkeyFile != "" {
+		var err error
+		pubKey, err = loadRSAPublicKey(*pubkeyFile)
+		if err != nil {
+			log.Fatalf("加载公钥失败: %v", err)
+		}
+		log.Printf("🔒 已启用助记词加密存储（RSA-4096 OAEP），服务端不持有私钥")
+	}
 
 	// 创建任务管理器
 	tm, err := scheduler.NewTaskManager(*dataDir)
@@ -170,6 +242,7 @@ func main() {
 		taskManager:   tm,
 		matchesFile:   filepath.Join(*dataDir, "matches.json"),
 		confirmedFile: filepath.Join(*dataDir, "confirmed.json"),
+		pubKey:        pubKey,
 		jobs:          make(map[string]*CompactJobRunner),
 		pendingTasks:  make(map[int64]pendingTaskRecord),
 		workers:       make(map[string]*WorkerInfo),
@@ -775,11 +848,22 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 		tronAddr := bip44.GetTronAddress(match.Address)
 
 		m := &Match{
-			Mnemonic:   mnemonicStr,
 			Address:    tronAddr,
 			RawAddrHex: hex.EncodeToString(match.Address),
 			Time:       time.Now(),
 			rawAddr:    match.Address,
+		}
+
+		if s.pubKey != nil {
+			// 启用非对称加密：明文加密后立即丢弃，服务端不保留
+			enc, err := encryptMnemonicRSA(s.pubKey, mnemonicStr)
+			if err != nil {
+				log.Printf("[Match] 加密助记词失败: %v", err)
+				continue
+			}
+			m.EncryptedMnemonic = enc
+		} else {
+			m.Mnemonic = mnemonicStr
 		}
 
 		s.matchesMu.Lock()
@@ -789,7 +873,11 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 
 		log.Printf("========== 匹配 ✅已验证 ==========")
 		log.Printf("Worker: %s", workerID)
-		log.Printf("助记词: %s", mnemonicStr)
+		if s.pubKey != nil {
+			log.Printf("助记词: [已加密，仅私钥持有人可解密]")
+		} else {
+			log.Printf("助记词: %s", mnemonicStr)
+		}
 		log.Printf("地址: %s", tronAddr)
 		log.Printf("====================================")
 
@@ -826,19 +914,25 @@ func (s *Server) indexToMnemonic(taskID int64, idx int64) string {
 // handleMatches 匹配结果
 func (s *Server) handleMatches(w http.ResponseWriter, r *http.Request) {
 	s.matchesMu.Lock()
-	matches := s.matches
+	views := make([]MatchView, len(s.matches))
+	for i, m := range s.matches {
+		views[i] = matchToView(m)
+	}
 	s.matchesMu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"matches": matches})
+	json.NewEncoder(w).Encode(map[string]interface{}{"matches": views})
 }
 
 // handleConfirmed 确认成功的地址
 func (s *Server) handleConfirmed(w http.ResponseWriter, r *http.Request) {
 	s.confirmedMu.Lock()
-	confirmed := s.confirmed
+	views := make([]MatchView, len(s.confirmed))
+	for i, m := range s.confirmed {
+		views[i] = matchToView(m)
+	}
 	s.confirmedMu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"confirmed": confirmed})
+	json.NewEncoder(w).Encode(map[string]interface{}{"confirmed": views})
 }
 
 // handleWorkers Worker列表
@@ -868,6 +962,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"workers":   len(s.workers),
 		"matches":   len(s.matches),
 		"completed": totalCompleted,
+		"encrypted": s.pubKey != nil, // 是否启用了非对称加密
 	})
 }
 

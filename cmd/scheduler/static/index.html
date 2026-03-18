@@ -198,6 +198,24 @@
         .matches-panel {
             background: #1e293b; border-radius: 12px; padding: 16px; margin-top: 24px;
         }
+        /* 加密模式：密文文本框 */
+        .mnemonic-cipher {
+            background: #020617; border: 1px solid #334155;
+            border-radius: 6px; padding: 8px; margin-top: 6px;
+            font-family: monospace; font-size: 10px; color: #64748b;
+            width: 100%; box-sizing: border-box; resize: none;
+            word-break: break-all; white-space: pre-wrap; cursor: pointer;
+        }
+        .mnemonic-cipher:hover { border-color: #475569; color: #94a3b8; }
+        .copy-hint { font-size: 10px; color: #475569; margin-top: 3px; }
+        .decrypt-hint {
+            background: #0f172a; border: 1px solid #1e3a5f;
+            border-radius: 6px; padding: 8px 10px; margin-top: 8px;
+            font-size: 10px; color: #475569; font-family: monospace;
+        }
+        .decrypt-hint b { color: #60a5fa; display: block; margin-bottom: 4px; }
+        .decrypt-hint code { color: #7dd3fc; word-break: break-all; }
+        .badge-encrypted { background: #1e3a5f; color: #60a5fa; }
         /* 确认成功 - 独立栏目 */
         .confirmed-panel {
             background: #052e16; border: 1px solid #16a34a;
@@ -339,6 +357,9 @@
         // 折叠状态：job-id → true/false（true=展开）
         const jobExpanded = {};
 
+        // 是否启用非对称加密（由 /api/stats 返回）
+        let encryptedMode = false;
+
         function toggleCreateForm() {
             const body = document.getElementById('create-form-body');
             const toggle = document.getElementById('create-form-toggle');
@@ -374,6 +395,9 @@
                 document.getElementById('stat-workers').textContent = onlineCount;
                 document.getElementById('stat-completed').textContent = formatNum(stats.completed || 0);
                 document.getElementById('stat-matches').textContent = stats.matches || 0;
+
+                // 更新加密模式标志
+                encryptedMode = !!stats.encrypted;
 
                 // 总速度 = 各在线 Worker 速度之和
                 const totalSpeed = workers
@@ -534,6 +558,32 @@
             }).join('');
         }
 
+        // 渲染助记词区域：加密模式显示可复制密文，否则显示明文
+        function renderMnemonicField(m) {
+            if (m.encrypted_mnemonic) {
+                return `
+                    <textarea class="mnemonic-cipher" rows="3" readonly
+                        onclick="copyMnemonic(this)" title="点击复制密文">${m.encrypted_mnemonic}</textarea>
+                    <div class="copy-hint">🔒 点击文本框复制密文，离线用私钥解密</div>
+                    <div class="decrypt-hint">
+                        <b>解密命令（在本地执行）：</b>
+                        <code>echo '&lt;粘贴密文&gt;' | base64 -d | openssl pkeyutl -decrypt -inkey private.pem -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256</code>
+                    </div>`;
+            }
+            if (m.mnemonic) {
+                return `<div class="match-mnemonic">${m.mnemonic}</div>`;
+            }
+            return '';
+        }
+
+        function copyMnemonic(el) {
+            el.select();
+            navigator.clipboard.writeText(el.value).then(() => {
+                const hint = el.nextElementSibling;
+                if (hint) { hint.textContent = '✅ 已复制'; setTimeout(() => { hint.textContent = '🔒 点击文本框复制密文，离线用私钥解密'; }, 2000); }
+            });
+        }
+
         async function refreshMatches() {
             const [matchesData, confirmedData] = await Promise.all([
                 fetchAPI('/matches'),
@@ -552,7 +602,10 @@
             const allRecent = stableMatches.slice(-20).reverse();
 
             // 统计
-            document.getElementById('match-count').textContent = `${matches.length} 个`;
+            const encBadge = encryptedMode
+                ? ' <span class="match-confirm-badge badge-encrypted">🔒 加密存储</span>'
+                : '';
+            document.getElementById('match-count').innerHTML = `${matches.length} 个${encBadge}`;
 
             // --- 已激活账户栏 ---
             const confirmedPanel = document.getElementById('confirmed-panel');
@@ -566,7 +619,7 @@
                         <div class="confirmed-item">
                             <div class="match-address">🏆 ${m.address}</div>
                             ${ct ? `<div class="match-create-time">发现时间: ${ct}</div>` : ''}
-                            <div class="match-mnemonic">${m.mnemonic}</div>
+                            ${renderMnemonicField(m)}
                         </div>`;
                 }).join('');
             } else {
@@ -596,7 +649,7 @@
                     <div class="match-item">
                         <div><span class="match-confirm-badge ${badgeClass}">${badge}</span></div>
                         <div class="match-address">${m.address}</div>
-                        <div class="match-mnemonic">${m.mnemonic}</div>
+                        ${renderMnemonicField(m)}
                     </div>`;
             }).join('');
         }
