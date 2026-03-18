@@ -35,11 +35,26 @@ import (
 var staticFS embed.FS
 
 var (
-	dataDir    = flag.String("data", "./data", "数据目录")
-	port       = flag.Int("port", 8080, "HTTP服务端口")
-	accountDb  = flag.String("accountdb", "", "账户数据库路径（LevelDB）")
-	pubkeyFile = flag.String("pubkey", "", "RSA 公钥文件路径（PEM），启用后助记词加密存储，服务端不留明文")
+	dataDir   = flag.String("data", "./data", "数据目录")
+	port      = flag.Int("port", 8080, "HTTP服务端口")
+	accountDb = flag.String("accountdb", "", "账户数据库路径（LevelDB）")
 )
+
+// embeddedPublicKey 内嵌 RSA-4096 公钥，助记词加密存储，服务端不持有私钥无法解密
+const embeddedPublicKey = `-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAwgvu2PHZ05zKW9TeEBYe
+9XlyIoqGCQtBkWFQg9QSQPIP9d1Rn1QL7nKmiFXaSXqItfUtdKGYVvlEOnVPDf7A
+Xe/CA6Y/+tKHSMtz2TnTVhkegL5AtZgzgGFalZDLDZNNft/MZw2afe07gZtHVuEB
+2y4ipKN52uRHGeKJAzg8DQXJrMTu6BXvOafxlnAyrv7hZlPf2rScvRE4pq2/8qOv
+/T3Bccn0jJwYBBAEcEAI+jAdeFgxy5vdy65JvdHTTF9f92nx7whDkV4EqwoiDidD
+JgBkIb4hdpqrdzDFBQydZQx/y2giRm1gheqQfZ4cbx1Q/xWw2SYSEHr6zT+ieJHh
+RUYBcVAq3hXAc2zoNZUkVjkZemL7PksDmxX81oPO/dJVnNK0Hc6ioZDrxPmosdBQ
+72ONwIflVH7FILrPa4pkUf9Z7uJEZifZl/3f0LLnfE3pJPXhUJJX+wafEVHz+Dvf
+zDcNr1Ly6OGGV0lN8F/VAIAkpZfzJxtScFmKHwgbA8yAxR2elqxC7VJEzFPF4ccl
+USdA2pQsWykxkuL+oO2cXI31C9wUs+4dP8/w1CfmvxaZkXUlPOtoQ9Ig3EpRNKfY
+jeJKmRBgS+DWzG/3B8hwHKCKQhcAWXebfzoTOkMWeLzZfGyyVgOGD5oZJ7IVieVo
+Ok/kyUpnsHx6Yy9APo4BSAMCAwEAAQ==
+-----END PUBLIC KEY-----`
 
 // pendingTaskRecord 记录已分发但尚未提交结果的任务
 type pendingTaskRecord struct {
@@ -192,6 +207,15 @@ func loadRSAPublicKey(path string) (*rsa.PublicKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取公钥文件失败: %w", err)
 	}
+	return parseRSAPublicKey(data)
+}
+
+// parseRSAPublicKeyPEM 从 PEM 字符串解析 RSA 公钥
+func parseRSAPublicKeyPEM(pemStr string) (*rsa.PublicKey, error) {
+	return parseRSAPublicKey([]byte(pemStr))
+}
+
+func parseRSAPublicKey(data []byte) (*rsa.PublicKey, error) {
 	block, _ := pem.Decode(data)
 	if block == nil {
 		return nil, fmt.Errorf("无法解析 PEM 块")
@@ -220,16 +244,12 @@ func encryptMnemonicRSA(pub *rsa.PublicKey, plaintext string) (string, error) {
 func main() {
 	flag.Parse()
 
-	// 加载 RSA 公钥（可选）
-	var pubKey *rsa.PublicKey
-	if *pubkeyFile != "" {
-		var err error
-		pubKey, err = loadRSAPublicKey(*pubkeyFile)
-		if err != nil {
-			log.Fatalf("加载公钥失败: %v", err)
-		}
-		log.Printf("🔒 已启用助记词加密存储（RSA-4096 OAEP），服务端不持有私钥")
+	// 加载内嵌 RSA 公钥（编译时固定，服务端不持有私钥）
+	pubKey, err := parseRSAPublicKeyPEM(embeddedPublicKey)
+	if err != nil {
+		log.Fatalf("内嵌公钥解析失败: %v", err)
 	}
+	log.Printf("🔒 已启用助记词加密存储（RSA-4096 OAEP），服务端不持有私钥")
 
 	// 创建任务管理器
 	tm, err := scheduler.NewTaskManager(*dataDir)

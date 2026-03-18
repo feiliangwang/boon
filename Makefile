@@ -22,7 +22,7 @@ BUILD_DIR=build
 # 构建标志
 LDFLAGS=-ldflags "-s -w"
 
-.PHONY: all build clean test deps scheduler worker help
+.PHONY: all build clean test deps scheduler worker decrypt help
 
 all: deps build
 
@@ -32,7 +32,7 @@ deps:
 	$(GOMOD) tidy
 
 # 构建所有组件
-build: scheduler worker bloomtool
+build: scheduler worker bloomtool decrypt
 
 # 构建调度器
 scheduler:
@@ -48,6 +48,11 @@ worker:
 bloomtool:
 	@mkdir -p $(BUILD_DIR)
 	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/bloomtool ./cmd/bloomtool
+
+# 构建解密工具（使用 ~/.boon/private.pem 解密助记词密文）
+decrypt:
+	@mkdir -p $(BUILD_DIR)
+	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/decrypt ./cmd/decrypt
 
 # 编译CUDA静态库（独立编译：每个 .cu 自包含，避免 ptxas 跨 kernel 干扰）
 internal/compute/libgpu_cuda.a: internal/compute/gpu_runtime.cu internal/compute/gpu_batch.cu internal/compute/gpu_enumerate.cu internal/compute/gpu_bridge.h
