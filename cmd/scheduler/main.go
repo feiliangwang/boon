@@ -786,7 +786,7 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		mnemonicStr := s.indexToMnemonic(result.TaskID, match.Index)
+		mnemonicStr := s.indexToMnemonic(rec.jobID, match.Index)
 
 		// 2. 验证地址正确性
 		if !s.verifyMatch(mnemonicStr, match.Address) {
@@ -871,7 +871,7 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	// 处理有效匹配
 	// ============================================================
 	for _, match := range validMatches {
-		mnemonicStr := s.indexToMnemonic(result.TaskID, match.Index)
+		mnemonicStr := s.indexToMnemonic(rec.jobID, match.Index)
 		tronAddr := bip44.GetTronAddress(match.Address)
 
 		m := &Match{
@@ -916,26 +916,27 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 // indexToMnemonic 从索引还原助记词
-func (s *Server) indexToMnemonic(taskID int64, idx int64) string {
+func (s *Server) indexToMnemonic(jobID string, idx int64) string {
 	s.jobsMu.RLock()
 	defer s.jobsMu.RUnlock()
 
-	for _, runner := range s.jobs {
-		words := make([]string, len(runner.Template.Words))
-		copy(words, runner.Template.Words)
-
-		wordCount := int64(len(mnemonic.WordList))
-		remaining := idx
-		for _, pos := range runner.Template.UnknownPos {
-			wordIdx := remaining % wordCount
-			remaining /= wordCount
-			words[pos] = mnemonic.WordList[wordIdx]
-		}
-
-		return strings.Join(words, " ")
+	runner, ok := s.jobs[jobID]
+	if !ok {
+		return ""
 	}
 
-	return ""
+	words := make([]string, len(runner.Template.Words))
+	copy(words, runner.Template.Words)
+
+	wordCount := int64(len(mnemonic.WordList))
+	remaining := idx
+	for _, pos := range runner.Template.UnknownPos {
+		wordIdx := remaining % wordCount
+		remaining /= wordCount
+		words[pos] = mnemonic.WordList[wordIdx]
+	}
+
+	return strings.Join(words, " ")
 }
 
 // handleMatches 匹配结果
