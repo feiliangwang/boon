@@ -361,21 +361,28 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 					v.ElapsedSeconds = int64(now.Sub(*job.StartedAt).Seconds())
 				}
 
-				// 速度 & ETA：总索引 / 总实际计算耗时（消除批次波动）
+				// 速度 & ETA：用墙钟滑动窗口计算（totalIdx / 真实流逝时间）
+				// 旧做法用 sum(worker耗时) 作分母，多 Worker 并行时会被倍数低估
 				if snap.running && len(snap.speedWindow) > 0 {
 					cutoff := now.Add(-60 * time.Second)
-					var totalIdx, totalDurNs int64
+					var totalIdx int64
+					var windowStart time.Time
 					for _, e := range snap.speedWindow {
 						if !e.t.Before(cutoff) {
 							totalIdx += e.indices
-							totalDurNs += int64(e.duration)
+							if windowStart.IsZero() || e.t.Before(windowStart) {
+								windowStart = e.t
+							}
 						}
 					}
-					if totalDurNs > 0 {
-						v.Speed = int64(float64(totalIdx) / float64(totalDurNs) * 1e9)
-						if v.Speed > 0 {
-							remaining := snap.totalIdx - snap.completedIdx
-							v.ETASeconds = remaining / v.Speed
+					if totalIdx > 0 && !windowStart.IsZero() {
+						windowSecs := now.Sub(windowStart).Seconds()
+						if windowSecs > 0 {
+							v.Speed = int64(float64(totalIdx) / windowSecs)
+							if v.Speed > 0 {
+								remaining := snap.totalIdx - snap.completedIdx
+								v.ETASeconds = remaining / v.Speed
+							}
 						}
 					}
 				}
