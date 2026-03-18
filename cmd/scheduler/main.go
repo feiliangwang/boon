@@ -38,6 +38,7 @@ var (
 	dataDir   = flag.String("data", "./data", "数据目录")
 	port      = flag.Int("port", 8080, "HTTP服务端口")
 	accountDb = flag.String("accountdb", "", "账户数据库路径（LevelDB）")
+	authFlag  = flag.String("auth", "", "Web UI 认证，格式 username:password（留空则不启用）")
 )
 
 // embeddedPublicKey 内嵌 RSA-4096 公钥，助记词加密存储，服务端不持有私钥无法解密
@@ -77,6 +78,12 @@ type Server struct {
 	matchesFile   string         // 匹配结果持久化文件路径
 	confirmedFile string         // 确认成功的地址持久化文件路径
 	pubKey        *rsa.PublicKey // RSA 公钥，非 nil 时启用助记词加密；服务端无私钥，无法解密
+
+	// Web UI 认证
+	authUser   string
+	authPass   string
+	sessions   map[string]time.Time
+	sessionsMu sync.Mutex
 
 	jobs   map[string]*CompactJobRunner
 	jobsMu sync.RWMutex
@@ -263,11 +270,23 @@ func main() {
 		matchesFile:   filepath.Join(*dataDir, "matches.json"),
 		confirmedFile: filepath.Join(*dataDir, "confirmed.json"),
 		pubKey:        pubKey,
+		sessions:      make(map[string]time.Time),
 		jobs:          make(map[string]*CompactJobRunner),
 		pendingTasks:  make(map[int64]pendingTaskRecord),
 		workers:       make(map[string]*WorkerInfo),
 		confirmed:     make([]*Match, 0),
 		seedComputer:  compute.NewCPUComputer(), // 用于验证提交的地址
+	}
+
+	// 解析 -auth 参数
+	if *authFlag != "" {
+		parts := strings.SplitN(*authFlag, ":", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			log.Fatalf("-auth 格式错误，应为 username:password")
+		}
+		server.authUser = parts[0]
+		server.authPass = parts[1]
+		log.Printf("🔐 Web UI 认证已启用，用户: %s", server.authUser)
 	}
 
 	// 初始化账户数据库
@@ -294,17 +313,22 @@ func main() {
 	go server.cleanWorkers()
 
 	// 路由
-	http.HandleFunc("/", server.handleIndex)
-	http.HandleFunc("/api/jobs", server.handleJobs)
-	http.HandleFunc("/api/jobs/", server.handleJobAction)
-	http.HandleFunc("/api/template", server.handleTemplate)
+	http.HandleFunc("/login", server.handleLoginPage)
+	http.HandleFunc("/api/login", server.handleLogin)
+	http.HandleFunc("/api/logout", server.handleLogout)
+	// Worker 路由不需要认证
 	http.HandleFunc("/api/task/fetch", server.handleTaskFetch)
 	http.HandleFunc("/api/task/submit", server.handleTaskSubmit)
-	http.HandleFunc("/api/matches", server.handleMatches)
-	http.HandleFunc("/api/confirmed", server.handleConfirmed)
-	http.HandleFunc("/api/workers", server.handleWorkers)
-	http.HandleFunc("/api/stats", server.handleStats)
-	http.HandleFunc("/api/bloom", server.handleBloomInfo)
+	http.HandleFunc("/api/template", server.handleTemplate)
+	// Web UI / Admin 路由需要认证
+	http.HandleFunc("/", server.withAuth(server.handleIndex))
+	http.HandleFunc("/api/jobs", server.withAuth(server.handleJobs))
+	http.HandleFunc("/api/jobs/", server.withAuth(server.handleJobAction))
+	http.HandleFunc("/api/matches", server.withAuth(server.handleMatches))
+	http.HandleFunc("/api/confirmed", server.withAuth(server.handleConfirmed))
+	http.HandleFunc("/api/workers", server.withAuth(server.handleWorkers))
+	http.HandleFunc("/api/stats", server.withAuth(server.handleStats))
+	http.HandleFunc("/api/bloom", server.withAuth(server.handleBloomInfo))
 
 	addr := fmt.Sprintf(":%d", *port)
 	log.Printf("服务器启动: http://localhost%s", addr)
@@ -318,6 +342,107 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data, _ := staticFS.ReadFile("static/index.html")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(data)
+}
+
+// withAuth 认证中间件：未启用认证时直接透传；启用时校验 session cookie
+func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.authUser == "" {
+			next(w, r)
+			return
+		}
+		if s.checkSession(r) {
+			next(w, r)
+			return
+		}
+		// API 请求返回 401，页面请求重定向到登录页
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":"未登录"}`))
+			return
+		}
+		http.Redirect(w, r, "/login", http.StatusFound)
+	}
+}
+
+// checkSession 验证 session cookie 是否有效（24小时有效期）
+func (s *Server) checkSession(r *http.Request) bool {
+	cookie, err := r.Cookie("boon_session")
+	if err != nil {
+		return false
+	}
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	t, ok := s.sessions[cookie.Value]
+	if !ok {
+		return false
+	}
+	if time.Since(t) > 24*time.Hour {
+		delete(s.sessions, cookie.Value)
+		return false
+	}
+	return true
+}
+
+// handleLogin POST /api/login — 验证凭据并设置 session cookie
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if s.authUser == "" || (req.Username == s.authUser && req.Password == s.authPass) {
+		token := make([]byte, 24)
+		rand.Read(token)
+		sid := hex.EncodeToString(token)
+		s.sessionsMu.Lock()
+		s.sessions[sid] = time.Now()
+		s.sessionsMu.Unlock()
+		http.SetCookie(w, &http.Cookie{
+			Name:     "boon_session",
+			Value:    sid,
+			Path:     "/",
+			MaxAge:   86400,
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		})
+		w.Write([]byte(`{"ok":true}`))
+		return
+	}
+	w.WriteHeader(http.StatusUnauthorized)
+	w.Write([]byte(`{"error":"用户名或密码错误"}`))
+}
+
+// handleLogout POST /api/logout — 注销 session
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie("boon_session")
+	if err == nil {
+		s.sessionsMu.Lock()
+		delete(s.sessions, cookie.Value)
+		s.sessionsMu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:   "boon_session",
+		Value:  "",
+		Path:   "/",
+		MaxAge: -1,
+	})
+	http.Redirect(w, r, "/login", http.StatusFound)
+}
+
+// handleLoginPage GET /login — 返回登录页面
+func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
+	data, _ := staticFS.ReadFile("static/login.html")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(data)
 }

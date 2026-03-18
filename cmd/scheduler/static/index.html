@@ -15,6 +15,13 @@
         }
         .container { max-width: 1400px; margin: 0 auto; }
         h1 { text-align: center; margin-bottom: 20px; color: #22d3ee; font-size: 1.8em; }
+        .header { position: relative; }
+        .logout-btn {
+            position: absolute; right: 0; top: 50%; transform: translateY(-50%);
+            background: transparent; border: 1px solid #334155; border-radius: 8px;
+            color: #94a3b8; padding: 6px 14px; font-size: 0.82em; cursor: pointer;
+        }
+        .logout-btn:hover { border-color: #ef4444; color: #f87171; }
 
         /* 状态栏 */
         .status-bar {
@@ -259,7 +266,10 @@
 </head>
 <body>
     <div class="container">
-        <h1>🍉 Boon - TRON 助记词枚举</h1>
+        <div class="header">
+            <h1>🍉 Boon - TRON 助记词枚举</h1>
+            <button class="logout-btn" onclick="logout()">退出登录</button>
+        </div>
 
         <!-- 状态栏 -->
         <div class="status-bar">
@@ -347,6 +357,11 @@
     <div class="refresh-indicator" id="refresh-indicator">刷新中...</div>
 
     <script>
+        async function logout() {
+            await fetch('/api/logout', {method: 'POST'});
+            window.location.href = '/login';
+        }
+
         // 记录各 Worker 历史最高速度，用于绘制相对进度条
         const peakSpeeds = {};
 
