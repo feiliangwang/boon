@@ -237,16 +237,21 @@ __device__ __noinline__ void en_hmac_sha512(
     en_sha512_init(&t); en_sha512_update(&t,opad,128); en_sha512_update(&t,inner,64); en_sha512_final(&t,out);
 }
 
+__device__ __forceinline__ void en_pbkdf2_hmac_sha512_core(
+        const uint64_t ipad_st[8], const uint64_t opad_st[8], uint8_t dk[64]);
+
 __device__ __noinline__ void en_pbkdf2_hmac_sha512(
         const uint8_t *pw, uint32_t pwlen, uint8_t dk[64])
 {
-    /* Compute ipad/opad mid-states: compress the 128-byte pad blocks once.
-     * Store only the 8-word state (64 B), not the full ctx (200 B).
-     * This eliminates 664 B of Local Memory spills in the hot loop. */
     uint64_t ipad_st[8], opad_st[8];
     sha512_init_key_pad_state(pw, pwlen, 0x36, ipad_st);
     sha512_init_key_pad_state(pw, pwlen, 0x5c, opad_st);
+    en_pbkdf2_hmac_sha512_core(ipad_st, opad_st, dk);
+}
 
+__device__ __forceinline__ void en_pbkdf2_hmac_sha512_core(
+        const uint64_t ipad_st[8], const uint64_t opad_st[8], uint8_t dk[64])
+{
     /* First HMAC: msg = "mnemonic\0\0\0\1" (12 bytes).
      * Inner: sha512(ipad_st || salt[12]) — total 140 bytes = 1120 bits.
      * Pad block: [salt[0..11]][0x80][zeros...][0x0000000000000460] */

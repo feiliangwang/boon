@@ -36,6 +36,8 @@ var (
 	benchN         = flag.Int("bench", 0, "测速模式：随机生成N个助记词测算计算速度（0=禁用）")
 	benchPBKDF2N   = flag.Int("bench-pbkdf2", 0, "PBKDF2测速：随机生成N个助记词，仅测 PBKDF2-HMAC-SHA512(2048)（需要-gpu）")
 	benchPBKDF2KN  = flag.Int("bench-pbkdf2-kernel", 0, "PBKDF2纯内核测速：预加载输入后仅统计GPU kernel时间（需要-gpu）")
+	benchPBKDF2CN  = flag.Int("bench-pbkdf2-core", 0, "PBKDF2核心测速：在GPU上准备ipad/opad后，仅统计2048次核心循环（需要-gpu）")
+	benchPBKDF2LN  = flag.Int("bench-pbkdf2-loop", 0, "PBKDF2分段测速：预先完成U1初始化，仅统计分段loop kernel时间（需要-gpu）")
 	verifyN        = flag.Int("verify", 0, "验证模式：随机生成N个助记词对比GPU与CPU结果（0=禁用）")
 	benchFullN     = flag.Int64("bench-full", 0, "全链路测速：模拟完整枚举→验证→计算流程，扫描N个索引（0=禁用）")
 	bloomTestMnem  = flag.String("bloom-test", "", "Bloom过滤器验证：给定助记词，对比CPU与GPU bloom结果")
@@ -80,6 +82,18 @@ func main() {
 	// 独立模式：PBKDF2纯内核测速
 	if *benchPBKDF2KN > 0 {
 		runPBKDF2KernelBench(*benchPBKDF2KN, parseGPUDevices(*gpuDevices, *useGPU))
+		return
+	}
+
+	// 独立模式：PBKDF2核心测速
+	if *benchPBKDF2CN > 0 {
+		runPBKDF2CoreBench(*benchPBKDF2CN, parseGPUDevices(*gpuDevices, *useGPU))
+		return
+	}
+
+	// 独立模式：PBKDF2分段loop测速
+	if *benchPBKDF2LN > 0 {
+		runPBKDF2LoopBench(*benchPBKDF2LN, parseGPUDevices(*gpuDevices, *useGPU))
 		return
 	}
 
@@ -433,6 +447,101 @@ func runPBKDF2KernelBench(total int, deviceIDs []int) {
 	fmt.Printf("算法: PBKDF2-HMAC-SHA512(2048)\n")
 	fmt.Printf("助记词总数: %d\n", total)
 	fmt.Printf("计时轮数: %d\n\n", rounds)
+	fmt.Printf("Kernel总耗时: %.3fms\n", kernelMs)
+	fmt.Printf("速度: %.0f 个/s  (%.1f kH/s)\n", speed, speed/1000.0)
+	fmt.Printf("样本: %016x\n\n", sample)
+}
+
+func runPBKDF2CoreBench(total int, deviceIDs []int) {
+	if len(deviceIDs) == 0 {
+		log.Fatalf("bench-pbkdf2-core 需要 GPU，请使用 -gpu 或 -gpu-devices")
+	}
+
+	deviceID := deviceIDs[0]
+	gpuComp, err := compute.NewGPUComputer(deviceID)
+	if err != nil {
+		log.Fatalf("GPU初始化失败: %v\n提示: 需要 CUDA 构建且有可用 GPU", err)
+	}
+	defer gpuComp.Close()
+
+	fmt.Printf("生成 %d 个随机助记词...\n", total)
+	mnemonics, err := genMnemonics(total)
+	if err != nil {
+		log.Fatalf("生成助记词失败: %v", err)
+	}
+
+	warmupN := 32
+	if warmupN > total {
+		warmupN = total
+	}
+	if warmupN > 0 {
+		if seeds := gpuComp.ComputePBKDF2Seeds(mnemonics[:warmupN]); len(seeds) == 0 {
+			log.Fatalf("PBKDF2 core warmup 失败")
+		}
+	}
+
+	rounds := 1
+	for rounds < 32 && total*rounds < 262144 {
+		rounds <<= 1
+	}
+
+	kernelMs, sample, ok := gpuComp.BenchmarkPBKDF2CoreKernel(mnemonics, rounds)
+	if !ok || kernelMs <= 0 {
+		log.Fatalf("PBKDF2 core benchmark 失败")
+	}
+
+	totalOps := float64(total * rounds)
+	speed := totalOps / (kernelMs / 1000.0)
+	fmt.Printf("\nPBKDF2 核心性能分析\n")
+	fmt.Printf("计算引擎: GPU(device %d)\n", deviceID)
+	fmt.Printf("算法: PBKDF2-HMAC-SHA512(2048)\n")
+	fmt.Printf("助记词总数: %d\n", total)
+	fmt.Printf("计时轮数: %d\n\n", rounds)
+	fmt.Printf("Kernel总耗时: %.3fms\n", kernelMs)
+	fmt.Printf("速度: %.0f 个/s  (%.1f kH/s)\n", speed, speed/1000.0)
+	fmt.Printf("样本: %016x\n\n", sample)
+}
+
+func runPBKDF2LoopBench(total int, deviceIDs []int) {
+	if len(deviceIDs) == 0 {
+		log.Fatalf("bench-pbkdf2-loop 需要 GPU，请使用 -gpu 或 -gpu-devices")
+	}
+
+	deviceID := deviceIDs[0]
+	gpuComp, err := compute.NewGPUComputer(deviceID)
+	if err != nil {
+		log.Fatalf("GPU初始化失败: %v\n提示: 需要 CUDA 构建且有可用 GPU", err)
+	}
+	defer gpuComp.Close()
+
+	fmt.Printf("生成 %d 个随机助记词...\n", total)
+	mnemonics, err := genMnemonics(total)
+	if err != nil {
+		log.Fatalf("生成助记词失败: %v", err)
+	}
+
+	warmupN := 32
+	if warmupN > total {
+		warmupN = total
+	}
+	if warmupN > 0 {
+		if seeds := gpuComp.ComputePBKDF2Seeds(mnemonics[:warmupN]); len(seeds) == 0 {
+			log.Fatalf("PBKDF2 loop warmup 失败")
+		}
+	}
+
+	const loopsPerLaunch = 64
+	kernelMs, sample, ok := gpuComp.BenchmarkPBKDF2LoopKernel(mnemonics, loopsPerLaunch)
+	if !ok || kernelMs <= 0 {
+		log.Fatalf("PBKDF2 loop benchmark 失败")
+	}
+
+	speed := float64(total) / (kernelMs / 1000.0)
+	fmt.Printf("\nPBKDF2 分段loop性能分析\n")
+	fmt.Printf("计算引擎: GPU(device %d)\n", deviceID)
+	fmt.Printf("算法: PBKDF2-HMAC-SHA512(2048)\n")
+	fmt.Printf("助记词总数: %d\n", total)
+	fmt.Printf("每次launch迭代数: %d\n\n", loopsPerLaunch)
 	fmt.Printf("Kernel总耗时: %.3fms\n", kernelMs)
 	fmt.Printf("速度: %.0f 个/s  (%.1f kH/s)\n", speed, speed/1000.0)
 	fmt.Printf("样本: %016x\n\n", sample)

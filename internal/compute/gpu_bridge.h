@@ -72,6 +72,46 @@ int gpu_benchmark_pbkdf2_kernel(
 );
 
 /*
+ * Benchmark only the PBKDF2 core loop after preparing ipad/opad states on the
+ * GPU. The timed region excludes mnemonic parsing and pad-state preparation.
+ *
+ * sample_out receives the first 8 bytes of the output buffer as a simple
+ * stability check.
+ *
+ * Returns 0 on success, -1 on CUDA error.
+ */
+int gpu_benchmark_pbkdf2_core_kernel(
+    int            device_id,
+    const uint8_t *mnemonic_data,
+    const int     *mnemonic_offsets,
+    const int     *mnemonic_lengths,
+    int            count,
+    int            rounds,
+    float         *kernel_ms_out,
+    uint64_t      *sample_out
+);
+
+/*
+ * Benchmark a hashcat-style staged PBKDF2 loop:
+ *   init -> repeated loop chunks (default chunk size chosen by the caller)
+ *
+ * The timed region includes only the repeated loop kernels after the initial
+ * ipad/opad + U1 preparation.
+ *
+ * Returns 0 on success, -1 on CUDA error.
+ */
+int gpu_benchmark_pbkdf2_loop_kernel(
+    int            device_id,
+    const uint8_t *mnemonic_data,
+    const int     *mnemonic_offsets,
+    const int     *mnemonic_lengths,
+    int            count,
+    int            loops_per_launch,
+    float         *kernel_ms_out,
+    uint64_t      *sample_out
+);
+
+/*
  * Enumerate index range on the specified GPU device:
  * BIP39 validation + full TRON address derivation.
  *

@@ -188,6 +188,60 @@ func (g *GPUComputer) BenchmarkPBKDF2Kernel(mnemonics []string, rounds int) (ker
 	return float64(ms), uint64(sampleC), true
 }
 
+// BenchmarkPBKDF2CoreKernel measures only the PBKDF2 core loop after ipad/opad
+// states have been prepared on the GPU.
+func (g *GPUComputer) BenchmarkPBKDF2CoreKernel(mnemonics []string, rounds int) (kernelMs float64, sample uint64, ok bool) {
+	if len(mnemonics) == 0 || rounds <= 0 {
+		return 0, 0, false
+	}
+	count := len(mnemonics)
+	flat, offsets, lengths := g.flattenMnemonics(mnemonics)
+
+	var ms C.float
+	var sampleC C.uint64_t
+	ret := C.gpu_benchmark_pbkdf2_core_kernel(
+		C.int(g.deviceID),
+		(*C.uint8_t)(unsafe.Pointer(&flat[0])),
+		(*C.int)(unsafe.Pointer(&offsets[0])),
+		(*C.int)(unsafe.Pointer(&lengths[0])),
+		C.int(count),
+		C.int(rounds),
+		&ms,
+		&sampleC,
+	)
+	if int(ret) < 0 {
+		return 0, 0, false
+	}
+	return float64(ms), uint64(sampleC), true
+}
+
+// BenchmarkPBKDF2LoopKernel measures a staged PBKDF2 loop that prepares U1 on
+// GPU and then iterates the remaining 2047 rounds in loop-sized chunks.
+func (g *GPUComputer) BenchmarkPBKDF2LoopKernel(mnemonics []string, loopsPerLaunch int) (kernelMs float64, sample uint64, ok bool) {
+	if len(mnemonics) == 0 || loopsPerLaunch <= 0 {
+		return 0, 0, false
+	}
+	count := len(mnemonics)
+	flat, offsets, lengths := g.flattenMnemonics(mnemonics)
+
+	var ms C.float
+	var sampleC C.uint64_t
+	ret := C.gpu_benchmark_pbkdf2_loop_kernel(
+		C.int(g.deviceID),
+		(*C.uint8_t)(unsafe.Pointer(&flat[0])),
+		(*C.int)(unsafe.Pointer(&offsets[0])),
+		(*C.int)(unsafe.Pointer(&lengths[0])),
+		C.int(count),
+		C.int(loopsPerLaunch),
+		&ms,
+		&sampleC,
+	)
+	if int(ret) < 0 {
+		return 0, 0, false
+	}
+	return float64(ms), uint64(sampleC), true
+}
+
 // EnumerateCompute performs BIP39 enumeration and TRON address derivation entirely on the GPU.
 // knownWordIndices: 12 entries where -1 means unknown position (word index 0-2047 otherwise).
 // unknownPositions: position indices in enumeration order (same order as index decomposition).

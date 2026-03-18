@@ -35,5 +35,15 @@ func (g *GPUComputer) BenchmarkPBKDF2Kernel(mnemonics []string, rounds int) (flo
 	return 0, 0, false
 }
 
+// BenchmarkPBKDF2CoreKernel 未实现，返回失败
+func (g *GPUComputer) BenchmarkPBKDF2CoreKernel(mnemonics []string, rounds int) (float64, uint64, bool) {
+	return 0, 0, false
+}
+
+// BenchmarkPBKDF2LoopKernel 未实现，返回失败
+func (g *GPUComputer) BenchmarkPBKDF2LoopKernel(mnemonics []string, loopsPerLaunch int) (float64, uint64, bool) {
+	return 0, 0, false
+}
+
 // Close 无操作
 func (g *GPUComputer) Close() error { return nil }
