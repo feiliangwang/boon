@@ -1255,7 +1255,7 @@ func (s *Server) restoreJobs() {
 			Job:               job,
 			Template:          template,
 			CurrentIdx:        job.Completed, // 从已分发位置继续
-			CompletedIdx:      0,
+			CompletedIdx:      job.Completed, // 恢复已完成计数，避免重启后进度归零
 			CommittedIdx:      job.Completed,
 			TotalIdx:          total,
 			BatchSize:         int64(job.BatchSize),
