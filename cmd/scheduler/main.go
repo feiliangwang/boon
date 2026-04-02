@@ -169,7 +169,7 @@ const (
 	// minBatchSize 最小批次大小（冷启动或速度未知时使用）
 	minBatchSize = 1000
 	// maxBatchSize 最大批次大小（防止单次分配过多）
-	maxBatchSize = 2_000_000
+	maxBatchSize = 2_000_000_000
 	// pendingTaskTimeout 飞行中任务超时时间（超过此时间未提交则回滚重分配）
 	pendingTaskTimeout = 5 * time.Minute
 )

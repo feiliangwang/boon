@@ -365,7 +365,6 @@ type pbkdf2SeedBenchResult struct {
 	deviceID int
 	count    int
 	elapsed  time.Duration
-	seeds    []byte
 }
 
 type pbkdf2KernelBenchResult struct {
@@ -377,6 +376,37 @@ type pbkdf2KernelBenchResult struct {
 }
 
 type pbkdf2KernelBenchFunc func(*compute.GPUComputer, []string) (float64, uint64, bool)
+
+func prepareGPUDeviceRunners(deviceIDs []int, warmupMnemonics []string) ([]gpuBenchRunner, error) {
+	if len(deviceIDs) == 0 {
+		return nil, fmt.Errorf("未指定可用GPU设备")
+	}
+	runners := make([]gpuBenchRunner, 0, len(deviceIDs))
+	for _, deviceID := range deviceIDs {
+		gpuComp, err := compute.NewGPUComputer(deviceID)
+		if err != nil {
+			closeGPUBenchRunners(runners)
+			return nil, fmt.Errorf("GPU %d 初始化失败: %w", deviceID, err)
+		}
+		runners = append(runners, gpuBenchRunner{deviceID: deviceID, gpu: gpuComp})
+	}
+
+	warmupN := 32
+	if warmupN > len(warmupMnemonics) {
+		warmupN = len(warmupMnemonics)
+	}
+	if warmupN > 0 {
+		for _, runner := range runners {
+			seeds := runner.gpu.ComputePBKDF2Seeds(warmupMnemonics[:warmupN])
+			if len(seeds) != warmupN*64 {
+				closeGPUBenchRunners(runners)
+				return nil, fmt.Errorf("GPU %d warmup 失败", runner.deviceID)
+			}
+		}
+	}
+
+	return runners, nil
+}
 
 func splitBenchmarkWork(total int, deviceIDs []int) []gpuBenchRunner {
 	if total <= 0 || len(deviceIDs) == 0 {
@@ -520,7 +550,7 @@ func runPBKDF2Bench(total int, deviceIDs []int) {
 		log.Fatalf("生成助记词失败: %v", err)
 	}
 
-	runners, err := prepareGPUBenchRunners(deviceIDs, mnemonics)
+	runners, err := prepareGPUDeviceRunners(deviceIDs, mnemonics)
 	if err != nil {
 		log.Fatalf("%v\n提示: 需要 CUDA 构建且有可用 GPU", err)
 	}
@@ -533,6 +563,10 @@ func runPBKDF2Bench(total int, deviceIDs []int) {
 
 	results := make([]pbkdf2SeedBenchResult, len(runners))
 	errCh := make(chan error, len(runners))
+	seedBuf := make([]byte, total*64)
+	const chunkSize = 65536
+	workCh := make(chan [2]int, len(runners)*2)
+
 	var wg sync.WaitGroup
 	start := time.Now()
 	for i, runner := range runners {
@@ -540,20 +574,37 @@ func runPBKDF2Bench(total int, deviceIDs []int) {
 		go func(i int, runner gpuBenchRunner) {
 			defer wg.Done()
 			localStart := time.Now()
-			seeds := runner.gpu.ComputePBKDF2Seeds(runner.mnemonics)
-			elapsed := time.Since(localStart)
-			if len(seeds) != len(runner.mnemonics)*64 {
-				errCh <- fmt.Errorf("GPU %d benchmark 失败: 返回长度=%d，期望=%d", runner.deviceID, len(seeds), len(runner.mnemonics)*64)
-				return
+			localCount := 0
+			for span := range workCh {
+				s, e := span[0], span[1]
+				seeds := runner.gpu.ComputePBKDF2Seeds(mnemonics[s:e])
+				expectLen := (e - s) * 64
+				if len(seeds) != expectLen {
+					errCh <- fmt.Errorf("GPU %d benchmark 失败: 返回长度=%d，期望=%d", runner.deviceID, len(seeds), expectLen)
+					return
+				}
+				copy(seedBuf[s*64:e*64], seeds)
+				localCount += (e - s)
 			}
 			results[i] = pbkdf2SeedBenchResult{
 				deviceID: runner.deviceID,
-				count:    len(runner.mnemonics),
-				elapsed:  elapsed,
-				seeds:    seeds,
+				count:    localCount,
+				elapsed:  time.Since(localStart),
 			}
 		}(i, runner)
 	}
+
+	go func() {
+		for start := 0; start < total; start += chunkSize {
+			end := start + chunkSize
+			if end > total {
+				end = total
+			}
+			workCh <- [2]int{start, end}
+		}
+		close(workCh)
+	}()
+
 	wg.Wait()
 	elapsed := time.Since(start)
 	close(errCh)
@@ -563,11 +614,7 @@ func runPBKDF2Bench(total int, deviceIDs []int) {
 		}
 	}
 
-	h := sha256.New()
-	for _, result := range results {
-		_, _ = h.Write(result.seeds)
-	}
-	sum := h.Sum(nil)
+	sum := sha256.Sum256(seedBuf)
 	speed := float64(total) / elapsed.Seconds()
 	fmt.Printf("总耗时: %s\n", fmtDuration(elapsed))
 	fmt.Printf("速度: %.0f 个/s  (%.1f kH/s)\n", speed, speed/1000.0)
@@ -885,52 +932,23 @@ func runVerify(total int, cpuWorkers int) {
 
 type fullBenchRunner struct {
 	deviceID int
-	startIdx int64
-	endIdx   int64
 	gpu      *compute.GPUComputer
 }
 
 type fullBenchResult struct {
 	deviceID int
-	startIdx int64
-	endIdx   int64
+	count    int64
 	elapsed  time.Duration
 }
 
-func splitFullBenchWork(total int64, deviceIDs []int) []fullBenchRunner {
-	if total <= 0 || len(deviceIDs) == 0 {
-		return nil
+func prepareFullBenchRunners(deviceIDs []int) ([]fullBenchRunner, error) {
+	if len(deviceIDs) == 0 {
+		return nil, fmt.Errorf("未指定可用GPU设备")
 	}
-
-	usedDevices := deviceIDs
-	if total < int64(len(usedDevices)) {
-		usedDevices = usedDevices[:int(total)]
+	runners := make([]fullBenchRunner, 0, len(deviceIDs))
+	for _, deviceID := range deviceIDs {
+		runners = append(runners, fullBenchRunner{deviceID: deviceID})
 	}
-
-	base := total / int64(len(usedDevices))
-	rem := total % int64(len(usedDevices))
-	start := int64(0)
-	runners := make([]fullBenchRunner, 0, len(usedDevices))
-	for i, deviceID := range usedDevices {
-		count := base
-		if int64(i) < rem {
-			count++
-		}
-		end := start + count
-		if count > 0 {
-			runners = append(runners, fullBenchRunner{
-				deviceID: deviceID,
-				startIdx: start,
-				endIdx:   end,
-			})
-		}
-		start = end
-	}
-	return runners
-}
-
-func prepareFullBenchRunners(total int64, deviceIDs []int) ([]fullBenchRunner, error) {
-	runners := splitFullBenchWork(total, deviceIDs)
 	for i := range runners {
 		gpuComp, err := compute.NewGPUComputer(runners[i].deviceID)
 		if err != nil {
@@ -1025,7 +1043,7 @@ func runBenchFull(total int64, deviceIDs []int, gpuRequested bool, cpuWorkers in
 		return
 	}
 
-	runners, err := prepareFullBenchRunners(total, deviceIDs)
+	runners, err := prepareFullBenchRunners(deviceIDs)
 	if err != nil {
 		log.Fatalf("%v\n提示: 需要 CUDA 构建且有可用 GPU", err)
 	}
@@ -1041,14 +1059,8 @@ func runBenchFull(total int64, deviceIDs []int, gpuRequested bool, cpuWorkers in
 				warmupTask := &protocol.CompactTask{
 					TaskID:   int64(runner.deviceID),
 					JobID:    1,
-					StartIdx: runner.startIdx,
-					EndIdx:   runner.startIdx + 2048,
-				}
-				if warmupTask.EndIdx > runner.endIdx {
-					warmupTask.EndIdx = runner.endIdx
-				}
-				if warmupTask.StartIdx >= warmupTask.EndIdx {
-					return
+					StartIdx: 0,
+					EndIdx:   2048,
 				}
 				warmupEnum := worker.NewLocalEnumerator(&worker.TaskTemplate{
 					JobID: 1, Words: append([]string(nil), knownWords...), UnknownPos: []int{8, 9, 10, 11},
@@ -1066,6 +1078,8 @@ func runBenchFull(total int64, deviceIDs []int, gpuRequested bool, cpuWorkers in
 		results := make([]fullBenchResult, len(runners))
 		errCh := make(chan error, len(runners))
 		var wg sync.WaitGroup
+		var nextStart int64
+		var mu sync.Mutex
 		start := time.Now()
 		for i, runner := range runners {
 			wg.Add(1)
@@ -1077,25 +1091,40 @@ func runBenchFull(total int64, deviceIDs []int, gpuRequested bool, cpuWorkers in
 				cc := compute.NewCompactComputer(1, runner.gpu)
 				cc.SetBatchSize(bs)
 				cc.SetEnumWorkers(runtime.NumCPU())
-				task := &protocol.CompactTask{
-					TaskID:   int64(i + 1),
-					JobID:    1,
-					StartIdx: runner.startIdx,
-					EndIdx:   runner.endIdx,
-				}
 
 				localStart := time.Now()
-				result := cc.ComputeRange(enum, task, nil)
-				elapsed := time.Since(localStart)
-				if result == nil {
-					errCh <- fmt.Errorf("GPU %d bench-full 失败", runner.deviceID)
-					return
+				localCount := int64(0)
+				for {
+					mu.Lock()
+					s := nextStart
+					if s >= total {
+						mu.Unlock()
+						break
+					}
+					e := s + bs
+					if e > total {
+						e = total
+					}
+					nextStart = e
+					mu.Unlock()
+
+					task := &protocol.CompactTask{
+						TaskID:   int64(i + 1),
+						JobID:    1,
+						StartIdx: s,
+						EndIdx:   e,
+					}
+					result := cc.ComputeRange(enum, task, nil)
+					if result == nil {
+						errCh <- fmt.Errorf("GPU %d bench-full 失败", runner.deviceID)
+						return
+					}
+					localCount += e - s
 				}
 				results[i] = fullBenchResult{
 					deviceID: runner.deviceID,
-					startIdx: runner.startIdx,
-					endIdx:   runner.endIdx,
-					elapsed:  elapsed,
+					count:    localCount,
+					elapsed:  time.Since(localStart),
 				}
 			}(i, runner)
 		}
@@ -1111,8 +1140,10 @@ func runBenchFull(total int64, deviceIDs []int, gpuRequested bool, cpuWorkers in
 		fmt.Printf("  %-12d  %-10s  %.0f\n", bs, fmtDuration(elapsed), float64(total)/elapsed.Seconds())
 		fmt.Printf("    设备明细:")
 		for _, result := range results {
-			count := result.endIdx - result.startIdx
-			speed := float64(count) / result.elapsed.Seconds()
+			speed := 0.0
+			if result.elapsed > 0 {
+				speed = float64(result.count) / result.elapsed.Seconds()
+			}
 			fmt.Printf(" GPU %d=%s/%.0f", result.deviceID, fmtDuration(result.elapsed), speed)
 		}
 		fmt.Printf("\n")
