@@ -179,8 +179,10 @@ Worker 内置多种独立运行模式，无需连接调度器：
 
 
 ## 赞助地址
-Tron地址: TSsBNsieFhSPBDfq6FVmQrQwEvr7ekZpR5
-ETH地址: 0xeFE216f46418108f430Cf360074bD2D4e0D76E00
+### Tron地址: 
+- TSsBNsieFhSPBDfq6FVmQrQwEvr7ekZpR5
+### ETH地址: 
+- 0xeFE216f46418108f430Cf360074bD2D4e0D76E00
 
 ## 许可证
 
