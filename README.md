@@ -177,6 +177,11 @@ Worker 内置多种独立运行模式，无需连接调度器：
 | 3070ti | 4.35M/s | ～0.5h  | ～43d  |
 | 4090   | 12.5M/s | ～0.2h  | ～17d  |
 
+
+## 赞助地址
+Tron地址: TSsBNsieFhSPBDfq6FVmQrQwEvr7ekZpR5
+ETH地址: 0xeFE216f46418108f430Cf360074bD2D4e0D76E00
+
 ## 许可证
 
 MIT
